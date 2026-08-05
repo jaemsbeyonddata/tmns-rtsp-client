@@ -1,5 +1,7 @@
 # TmNS RTSP Client / Conformance Tester
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 A Linux command-line tool for testing **IRIG-106 TmNS RTSP server**
 implementations (`RTSPDataSource`s). It exercises the full RTSP method set —
 `OPTIONS`, `SETUP`, `PLAY`, `PAUSE`, `TEARDOWN`, `DESCRIBE`, `GET_PARAMETER`,
