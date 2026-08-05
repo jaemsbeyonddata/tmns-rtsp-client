@@ -59,6 +59,8 @@ word4: MessageTimestamp(64)
 
 - `tmns_rtsp_client.py` — the client / conformance tester.
 - `tmns_mock_server.py` — a minimal mock `RTSPDataSource` test fixture.
+- `chapter11.py` — IRIG-106 Chapter 11 packet reader + Appendix 24-A → TmNS mapping.
+- `make_sample_ch10.py` — generates a small valid `.ch10` file for testing.
 
 ## Usage
 
@@ -215,9 +217,45 @@ python3 tmns_rtsp_client.py test 127.0.0.1 --mdid 7 \
     --lower UDP --client-port 6970 --dest-ip 127.0.0.1 --play-seconds 2
 ```
 
-Expected: all checks `PASS`, `Result: 13/13 checks passed`. Use
-`--range 'ptp-clock=start-end'` to exercise the bounded-range End-of-Data path
-(`end_of_data=True`).
+Expected: all checks `PASS`. Use `--range 'ptp-clock=start-end'` to exercise
+the bounded-range End-of-Data path (`end-of-data: yes`).
+
+## Chapter 11 playback (Appendix 24-A)
+
+The mock can play back a real **IRIG-106 Chapter 11** (`.ch10`/`.c10`)
+recording instead of synthetic data, encapsulating each Chapter 11 packet body
+as a TmNS Package using the **Chapter 24 Appendix 24-A** field mapping:
+
+| Chapter 11 field | → TmNS field |
+| --- | --- |
+| Channel ID (16b) | lower 16 bits of **MDID** (upper 16 via `--mdid-upper`) |
+| Data Type (8b) | bits 15..8 of **PDID** |
+| Data Type Version (8b) | bits 7..0 of **PDID** |
+| Packet Body | TmNS Package payload (MeasurementData) |
+
+```bash
+# generate a small valid sample recording (or use your own .ch10)
+python3 make_sample_ch10.py -o sample.ch10 -n 12
+
+# terminal 1 — play it back as a TmNS RTSPDataSource
+python3 tmns_mock_server.py --port 55554 --ch10 sample.ch10 --rate 30
+
+# terminal 2 — receive and decode the mapped Packages until End-of-Data
+python3 tmns_rtsp_client.py stream 127.0.0.1 --lower TCP --client-port 6970 \
+    --dest-ip 127.0.0.1 --play-seconds 0 --decode --hexdump
+```
+
+Delivered messages carry the `PlaybackDataFlag`; sequence numbers are a proper
+monotonic per-MDID counter (Ch.26 §26.5.1). `--loop` replays the file
+continuously; `--rate 0` sends as fast as possible. End-of-Data is sent when
+the file is exhausted (unless looping).
+
+Limitations: a Chapter 11 packet body must fit a single 16-bit `PackageLength`
+(≤ 65,523 bytes of body); larger packets are skipped with a warning (TmNS
+message fragmentation is not implemented). Chapter 11 secondary-header time is
+not decoded into `MessageTimestamp` (the RTC is carried in `PackageTimeDelta`
+and the message timestamp is the send time). The mock streams all packets and
+does not filter by the request URI's MDID list.
 
 ## Notes & limits
 

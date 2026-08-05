@@ -30,14 +30,21 @@ of RCC/IRIG 106 Chapter 26 to be useful:
   * Parses the TmNS Transport header, opens the RTSPDataChannel:
       - UDP: sends TmNSDataMessages to the sink's client_port.
       - TCP: connects to the sink's listening client_port (source connects).
-  * On PLAY, streams synthetic TmNSDataMessages (Chapter 24 header) built with
-    a standard PackageHeader and an ApplicationDefinedFields option, so the
-    client's payload decoder has something real to parse.  A bounded Range
-    finishes with an EndOfDataFlag message.
+  * On PLAY, streams TmNSDataMessages (Chapter 24 header) built with a standard
+    PackageHeader and ApplicationDefinedFields options.  Two data sources:
+      - synthetic (default): generated MeasurementData, so the client's payload
+        decoder has something to parse; a bounded Range finishes with an
+        EndOfDataFlag message.
+      - Chapter 11 playback (--ch10 FILE): reads an IRIG-106 Chapter 11
+        recording and streams each packet body as a TmNS Package, mapping the
+        Chapter 11 fields into TmNS per Chapter 24 Appendix 24-A (Channel ID ->
+        MDID low 16 bits, Data Type/Version -> PDID).  End-of-Data is sent when
+        the file is exhausted.
 
 Usage:
     python3 tmns_mock_server.py [--port 55554] [--mdid 1] [--pdid 100]
                                 [--rate 20] [--session-timeout 60]
+    python3 tmns_mock_server.py --ch10 recording.ch10 [--mdid-upper 0] [--loop]
 """
 
 import argparse
@@ -47,8 +54,11 @@ import struct
 import threading
 import time
 
+import chapter11
+
 DATAMSG_HEADER_LEN = 24
 STD_PKG_HEADER_LEN = 12
+MAX_PACKAGE_LEN = 0xFFFF  # PackageLength is 16 bits (Ch.24 24.2.2.1.1)
 
 RANGE_RE = re.compile(
     r"ptp-clock\s*=\s*(start|now|\d+)\s*-\s*(end|now|\d+)?\s*$", re.I)
@@ -124,12 +134,16 @@ class Session:
 
 
 class MockSource:
-    def __init__(self, port, mdid, pdid, rate, session_timeout):
+    def __init__(self, port, mdid, pdid, rate, session_timeout,
+                 ch10_path=None, mdid_upper=0, loop=False):
         self.port = port
         self.mdid = mdid
         self.pdid = pdid
         self.rate = rate
         self.session_timeout = session_timeout
+        self.ch10_path = ch10_path
+        self.mdid_upper = mdid_upper
+        self.loop = loop
         self.sessions = {}
         self._sid_counter = 0x1000
 
@@ -138,8 +152,12 @@ class MockSource:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("0.0.0.0", self.port))
         srv.listen(5)
+        source = (f"Chapter 11 playback: {self.ch10_path}"
+                  f"{' (looping)' if self.loop else ''}"
+                  if self.ch10_path else
+                  f"synthetic mdid={self.mdid} pdid={self.pdid}")
         print(f"[mock] TmNS RTSPDataSource listening on TCP :{self.port} "
-              f"(mdid={self.mdid}, pdid={self.pdid}, rate={self.rate}/s, "
+              f"({source}, rate={self.rate}/s, "
               f"session_timeout={self.session_timeout}s)")
         try:
             while True:
@@ -325,30 +343,27 @@ class MockSource:
             print(f"[mock] data channel {sess.lower} -> "
                   f"{sess.dest or addr[0]}:{sess.client_port}")
 
-            seq = 0
-            interval = 1.0 / self.rate if self.rate > 0 else 0.05
+            interval = 1.0 / self.rate if self.rate > 0 else 0.0
+            source = (self._ch10_messages if self.ch10_path
+                      else self._synthetic_messages)
             sent = 0
             try:
-                while not sess.stop.is_set():
-                    if not sess.streaming.is_set():
-                        time.sleep(0.02)
-                        continue
-                    # two Packages of synthetic MeasurementData
-                    t = time.time()
-                    m0 = struct.pack(">Qdi", seq, t, seq * seq) + b"\xa5" * 4
-                    m1 = struct.pack(">Qf", seq, float(seq) / 10.0)
-                    pkgs = [build_package(self.pdid, m0, time_delta=seq * 1000),
-                            build_package(self.pdid + 1, m1, time_delta=seq * 1000)]
-                    msg = build_datamsg(self.mdid, seq, packages=pkgs,
-                                        options=build_options(len(pkgs)))
-                    send(msg)
-                    seq += 1
-                    sent += 1
-                    time.sleep(interval)
-                    if sess.bounded and sent >= 25:
-                        send(build_datamsg(0, 0, end_of_data=True))
-                        print("[mock] sent End-of-Data indication")
+                for msg in source(sess):
+                    if sess.stop.is_set():
                         break
+                    while not sess.streaming.is_set() and not sess.stop.is_set():
+                        time.sleep(0.02)     # paused
+                    if sess.stop.is_set():
+                        break
+                    send(msg)
+                    sent += 1
+                    if interval:
+                        time.sleep(interval)
+                else:
+                    # generator exhausted (Chapter 11 file finished) -> End-of-Data
+                    if not sess.stop.is_set():
+                        send(build_datamsg(0, 0, end_of_data=True))
+                        print(f"[mock] End-of-Data after {sent} message(s)")
             except OSError as e:
                 print(f"[mock] data send stopped: {e}")
             finally:
@@ -357,18 +372,82 @@ class MockSource:
         sess.thread = threading.Thread(target=run, daemon=True)
         sess.thread.start()
 
+    def _synthetic_messages(self, sess):
+        """Yield synthetic TmNSDataMessages (two Packages each).
+
+        Runs until stop; a bounded Range ends the stream with End-of-Data.
+        """
+        seq = 0
+        while not sess.stop.is_set():
+            t = time.time()
+            m0 = struct.pack(">Qdi", seq, t, seq * seq) + b"\xa5" * 4
+            m1 = struct.pack(">Qf", seq, float(seq) / 10.0)
+            pkgs = [build_package(self.pdid, m0, time_delta=seq * 1000),
+                    build_package(self.pdid + 1, m1, time_delta=seq * 1000)]
+            yield build_datamsg(self.mdid, seq, packages=pkgs,
+                                options=build_options(len(pkgs)))
+            seq += 1
+            if sess.bounded and seq >= 25:
+                # bounded Range: stream ends; run() emits the End-of-Data marker
+                return
+
+    def _ch10_messages(self, sess):
+        """Yield TmNSDataMessages built from a Chapter 11 recording.
+
+        Each Chapter 11 packet body becomes one TmNS Package, mapped per
+        Chapter 24 Appendix 24-A. MessageDefinitionSequenceNumber is a proper
+        monotonic per-MDID counter (Ch.26 26.5.1), which supersedes the
+        appendix's notional "Ch11 seq -> low 8 bits" guidance.
+        """
+        seqs = {}
+        skipped = 0
+        while not sess.stop.is_set():
+            with open(self.ch10_path, "rb") as f:
+                for pkt in chapter11.iter_packets(f):
+                    if sess.stop.is_set():
+                        return
+                    mdid, pdid, body = chapter11.map_to_tmns(pkt, self.mdid_upper)
+                    if STD_PKG_HEADER_LEN + len(body) > MAX_PACKAGE_LEN:
+                        skipped += 1
+                        print(f"[mock] skip Ch11 pkt ch={pkt.channel_id} "
+                              f"dtype={chapter11.data_type_name(pkt.data_type)}: "
+                              f"body {len(body)}B exceeds 16-bit PackageLength")
+                        continue
+                    seq = seqs.get(mdid, 0)
+                    seqs[mdid] = seq + 1
+                    pkg = build_package(pdid, body, time_delta=pkt.rtc & 0xFFFFFFFF)
+                    yield build_datamsg(mdid, seq, packages=[pkg],
+                                        options=build_options(1), playback=True)
+            if not self.loop:
+                if skipped:
+                    print(f"[mock] ({skipped} oversized packet(s) skipped)")
+                return
+            # loop: replay the file until stopped (no End-of-Data between loops)
+
 
 def main():
     ap = argparse.ArgumentParser(description="Mock TmNS RTSPDataSource for testing.")
     ap.add_argument("--port", type=int, default=55554)
-    ap.add_argument("--mdid", type=int, default=1, help="MessageDefinitionID to emit")
-    ap.add_argument("--pdid", type=int, default=100, help="PackageDefinitionID to emit")
-    ap.add_argument("--rate", type=float, default=20.0, help="messages per second")
+    ap.add_argument("--mdid", type=int, default=1,
+                    help="MessageDefinitionID to emit (synthetic mode)")
+    ap.add_argument("--pdid", type=int, default=100,
+                    help="PackageDefinitionID to emit (synthetic mode)")
+    ap.add_argument("--rate", type=float, default=20.0,
+                    help="messages per second (0 = as fast as possible)")
     ap.add_argument("--session-timeout", type=int, default=60,
                     help="RTSP session timeout advertised/enforced (seconds)")
+    ap.add_argument("--ch10", metavar="FILE",
+                    help="play back an IRIG-106 Chapter 11 (.ch10/.c10) recording, "
+                         "mapping packets to TmNS per Chapter 24 Appendix 24-A")
+    ap.add_argument("--mdid-upper", type=int, default=0,
+                    help="user-defined upper 16 bits of the MDID for Ch11 playback "
+                         "(lower 16 bits come from the Channel ID; default 0)")
+    ap.add_argument("--loop", action="store_true",
+                    help="replay the Chapter 11 file continuously until stopped")
     args = ap.parse_args()
     MockSource(args.port, args.mdid, args.pdid, args.rate,
-               args.session_timeout).serve()
+               args.session_timeout, ch10_path=args.ch10,
+               mdid_upper=args.mdid_upper, loop=args.loop).serve()
 
 
 if __name__ == "__main__":
