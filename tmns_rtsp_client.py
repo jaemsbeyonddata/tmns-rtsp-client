@@ -54,6 +54,7 @@ Author: generated for TmNS RTSP interoperability testing.
 """
 
 import argparse
+import errno
 import os
 import re
 import selectors
@@ -244,6 +245,19 @@ class RTSPClient:
                 self.sock.close()
             finally:
                 self.sock = None
+
+    def reconnect(self) -> None:
+        """Re-establish the control channel after a drop.
+
+        Closes the old socket, clears any partial buffer, and drops the
+        session (a dropped control connection invalidates its RTSP session).
+        The CSeq counter keeps advancing so requests stay unique.
+        """
+        self.close()
+        self._buf = b""
+        self.session = None
+        self.session_timeout = None
+        self.connect()
 
     def __enter__(self):
         self.connect()
@@ -1277,6 +1291,31 @@ INTERACTIVE_COMMANDS = [
 ]
 
 
+_CONN_DEAD_ERRNOS = {
+    errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN, errno.EBADF,
+    errno.ESHUTDOWN, errno.ECONNABORTED, errno.ETIMEDOUT,
+}
+
+
+def _connection_dead(exc: Exception) -> bool:
+    """True if the control connection is unusable and needs reconnecting."""
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                        ConnectionAbortedError)):
+        return True
+    if isinstance(exc, OSError) and exc.errno in _CONN_DEAD_ERRNOS:
+        return True
+    if isinstance(exc, RTSPError):
+        m = str(exc).lower()
+        return ("connection closed" in m or "not connected" in m
+                or "timeout" in m)
+    return False
+
+
+# Commands that start a fresh exchange and are safe to auto-retry after a
+# reconnect (they don't depend on prior session state).
+_RETRYABLE_CMDS = {"options", "describe", "descr", "setup"}
+
+
 def _setup_readline():
     """Enable up/down-arrow command history and line editing for the REPL.
 
@@ -1348,7 +1387,11 @@ def cmd_interactive(args) -> int:
     uri = resolve_uri(args)
     transport = resolve_transport(args)
     c = RTSPClient(args.host, args.port, args.timeout, verbose=True)
-    c.connect()
+    try:
+        c.connect()
+    except OSError as e:
+        cprint(f"! could not connect to {c.host}:{c.port} ({e}); "
+               f"commands will retry the connection.", C.YELLOW)
     data: Optional[DataChannel] = None
     readline = _setup_readline()
     cprint("Interactive TmNS RTSP session. Type 'help' (or '?') "
@@ -1357,6 +1400,66 @@ def cmd_interactive(args) -> int:
         cprint("Use the up/down arrows to recall previous commands.\n", C.DIM)
     else:
         print()
+
+    def close_data():
+        nonlocal data
+        if data:
+            data.close()
+            data = None
+
+    def handle(cmd, parts):
+        """Execute one command. Returns 'quit' to exit, else None."""
+        nonlocal data, uri
+        if cmd in ("quit", "exit", "q"):
+            return "quit"
+        elif cmd in ("help", "?", "h"):
+            _print_interactive_help(uri, transport, args, c.session)
+        elif cmd == "uri":
+            uri = parts[1]; cprint(f"uri set: {uri}", C.DIM)
+        elif cmd == "options":
+            c.options(uri)
+        elif cmd == "setup":
+            close_data()                 # release any previous data channel
+            data = DataChannel(args.lower, args.client_port, verbose=True,
+                               decode=args.decode, hexdump=args.hexdump,
+                               decode_limit=args.decode_limit)
+            data.open()
+            c.setup(uri, transport)
+        elif cmd == "play":
+            c.play(uri, prange=args.range, speed=args.speed, bandwidth=args.bandwidth)
+            if data:
+                secs = float(parts[1]) if len(parts) > 1 else args.play_seconds
+                dur = secs if secs > 0 else None
+                ka, ka_int = make_keepalive(c, uri, args.keepalive)
+                cprint("* Receiving "
+                       + (f"for {secs:g}s" if dur else "until End-of-Data")
+                       + " (Ctrl-C to stop) ...", C.DIM)
+                stats = data.receive(dur, stats_interval=args.stats_interval,
+                                     keepalive=ka, keepalive_interval=ka_int)
+                print_play_summary(stats)
+        elif cmd == "pause":
+            c.pause(uri)
+        elif cmd == "teardown":
+            c.teardown(uri)
+            close_data()
+        elif cmd == "record":
+            c.record(uri, prange=parts[1] if len(parts) > 1 else args.range)
+        elif cmd == "redirect":
+            c.redirect(uri)
+        elif cmd == "announce":
+            c.announce(uri, (" ".join(parts[1:])).encode())
+        elif cmd in ("describe", "descr"):
+            r = c.describe(uri)
+            if r.ok and r.body:
+                _print_sdp(r.body)
+        elif cmd == "get":
+            c.get_parameter(uri, parts[1:] or None)
+        elif cmd == "set" and len(parts) >= 3:
+            c.set_parameter(uri, {parts[1]: " ".join(parts[2:])})
+        else:
+            cprint(f"? unknown command: {cmd}  (type 'help')", C.YELLOW)
+        return None
+
     try:
         while True:
             try:
@@ -1368,60 +1471,34 @@ def cmd_interactive(args) -> int:
             parts = line.split()
             cmd = parts[0].lower()
             try:
-                if cmd in ("quit", "exit", "q"):
+                if handle(cmd, parts) == "quit":
                     break
-                elif cmd in ("help", "?", "h"):
-                    _print_interactive_help(uri, transport, args, c.session)
-                elif cmd == "uri":
-                    uri = parts[1]; cprint(f"uri set: {uri}", C.DIM)
-                elif cmd == "options":
-                    c.options(uri)
-                elif cmd == "setup":
-                    data = DataChannel(args.lower, args.client_port, verbose=True,
-                                       decode=args.decode, hexdump=args.hexdump,
-                                       decode_limit=args.decode_limit)
-                    data.open()
-                    c.setup(uri, transport)
-                elif cmd == "play":
-                    c.play(uri, prange=args.range, speed=args.speed, bandwidth=args.bandwidth)
-                    if data:
-                        secs = float(parts[1]) if len(parts) > 1 else args.play_seconds
-                        dur = secs if secs > 0 else None
-                        ka, ka_int = make_keepalive(c, uri, args.keepalive)
-                        cprint("* Receiving "
-                               + (f"for {secs:g}s" if dur else "until End-of-Data")
-                               + " (Ctrl-C to stop) ...", C.DIM)
-                        stats = data.receive(dur, stats_interval=args.stats_interval,
-                                             keepalive=ka, keepalive_interval=ka_int)
-                        print_play_summary(stats)
-                elif cmd == "pause":
-                    c.pause(uri)
-                elif cmd == "teardown":
-                    c.teardown(uri)
-                    if data:
-                        data.close(); data = None
-                elif cmd == "record":
-                    c.record(uri, prange=parts[1] if len(parts) > 1 else args.range)
-                elif cmd == "redirect":
-                    c.redirect(uri)
-                elif cmd == "announce":
-                    c.announce(uri, (" ".join(parts[1:])).encode())
-                elif cmd in ("describe", "descr"):
-                    r = c.describe(uri)
-                    if r.ok and r.body:
-                        _print_sdp(r.body)
-                elif cmd == "get":
-                    c.get_parameter(uri, parts[1:] or None)
-                elif cmd == "set" and len(parts) >= 3:
-                    c.set_parameter(uri, {parts[1]: " ".join(parts[2:])})
-                else:
-                    cprint(f"? unknown command: {cmd}  (type 'help')", C.YELLOW)
             except (RTSPError, OSError) as e:
-                cprint(f"! {e}", C.RED)
+                if not _connection_dead(e):
+                    cprint(f"! {e}", C.RED)
+                    continue
+                # control connection dropped -- recover transparently
+                cprint(f"! control connection lost ({e})", C.YELLOW)
+                close_data()             # session is gone; drop the data channel
+                try:
+                    c.reconnect()
+                except OSError as re_err:
+                    cprint(f"! reconnect to {c.host}:{c.port} failed ({re_err}); "
+                           f"check the server, then retry.", C.RED)
+                    continue
+                cprint(f"* reconnected to {c.host}:{c.port}; session reset.",
+                       C.GREEN)
+                if cmd in _RETRYABLE_CMDS:
+                    cprint(f"* retrying '{cmd}' ...", C.DIM)
+                    try:
+                        handle(cmd, parts)
+                    except (RTSPError, OSError) as e2:
+                        cprint(f"! {e2}", C.RED)
+                else:
+                    cprint("  (re-run 'setup' to start a new stream.)", C.DIM)
     finally:
         _save_history(readline)
-        if data:
-            data.close()
+        close_data()
         c.close()
     return 0
 

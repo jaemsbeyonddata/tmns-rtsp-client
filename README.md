@@ -185,6 +185,13 @@ arrows to recall previous commands. History is saved to
 `~/.tmns_rtsp_history`, so it persists across sessions (requires the `readline`
 module, standard on Linux/macOS).
 
+If the control connection drops (server restart, idle timeout, network blip),
+the session **auto-recovers**: the next command reports the loss, reconnects
+the control channel, resets the RTSP session, and (for `options`/`describe`/
+`setup`) retries automatically — so you don't have to quit and relaunch. After
+a reconnect the server-side session is gone, so re-run `setup` before
+`play`/`pause`/`teardown`.
+
 ```bash
 python3 tmns_rtsp_client.py interactive 10.0.0.5 --mdid 1 --lower UDP --client-port 6970
 ```
