@@ -174,9 +174,16 @@ python3 tmns_rtsp_client.py method 10.0.0.5 RECORD --range 'ptp-clock=now-'
 
 ### `interactive` — drive the control channel by hand
 
-Keeps one connection (and session) open. Commands: `options`, `describe`,
-`setup`, `play [secs]`, `pause`, `teardown`, `record [range]`, `redirect`,
-`announce <sdp>`, `get <p>`, `set <k> <v>`, `uri <new>`, `quit`.
+Keeps one connection (and session) open. Type `help` (or `?`) at the prompt
+for the full command list with parameters plus the current URI/transport/
+session context. Commands: `help`, `options`, `describe`, `setup`,
+`play [secs]`, `pause`, `teardown`, `record [range]`, `redirect`,
+`announce <sdp>`, `get [param...]`, `set <k> <v>`, `uri <new>`, `quit`.
+
+The prompt supports line editing and **command history** — use the up/down
+arrows to recall previous commands. History is saved to
+`~/.tmns_rtsp_history`, so it persists across sessions (requires the `readline`
+module, standard on Linux/macOS).
 
 ```bash
 python3 tmns_rtsp_client.py interactive 10.0.0.5 --mdid 1 --lower UDP --client-port 6970

@@ -54,6 +54,7 @@ Author: generated for TmNS RTSP interoperability testing.
 """
 
 import argparse
+import os
 import re
 import selectors
 import socket
@@ -64,6 +65,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 DEFAULT_PORT = 55554  # RCC 106 Ch.26: default RTSPControlChannel TCP port
+HISTORY_FILE = os.path.expanduser("~/.tmns_rtsp_history")
 DATAMSG_HEADER_LEN = 24
 USER_AGENT = "TmNS-RTSP-Client/1.0"
 
@@ -1255,6 +1257,78 @@ def cmd_method(args) -> int:
     return 0
 
 
+# (command, argument-spec, description) for the interactive help listing
+INTERACTIVE_COMMANDS = [
+    ("help, ?", "", "show this command list"),
+    ("options", "", "send OPTIONS (list supported methods)"),
+    ("describe", "", "send DESCRIBE and show the parsed SDP"),
+    ("setup", "", "open the data channel and send SETUP"),
+    ("play", "[secs]", "send PLAY and receive data (secs, or 0 = until End-of-Data;"
+                       " default --play-seconds)"),
+    ("pause", "", "send PAUSE"),
+    ("teardown", "", "send TEARDOWN and close the data channel"),
+    ("record", "[range]", "send RECORD (e.g. record ptp-clock=now-)"),
+    ("redirect", "", "send REDIRECT"),
+    ("announce", "<sdp...>", "send ANNOUNCE with the given text as the SDP body"),
+    ("get", "[param...]", "send GET_PARAMETER (optional parameter names)"),
+    ("set", "<key> <value...>", "send SET_PARAMETER as 'key: value'"),
+    ("uri", "<new-uri>", "change the request URI used by later commands"),
+    ("quit, exit, q", "", "close the session and exit"),
+]
+
+
+def _setup_readline():
+    """Enable up/down-arrow command history and line editing for the REPL.
+
+    Returns the readline module (or None if unavailable, e.g. on Windows
+    without a readline implementation).  Loads persisted history so previous
+    sessions' commands are recalled too.
+    """
+    try:
+        import readline
+    except ImportError:
+        return None
+    try:
+        readline.read_history_file(HISTORY_FILE)
+    except (FileNotFoundError, OSError):
+        pass
+    readline.set_history_length(1000)
+    return readline
+
+
+def _save_history(readline) -> None:
+    if readline is None:
+        return
+    try:
+        readline.write_history_file(HISTORY_FILE)
+    except OSError:
+        pass
+
+
+def _prompt() -> str:
+    """REPL prompt; wraps color escapes in readline-ignore markers so line
+    editing and history recall compute the cursor width correctly."""
+    if C.enabled:
+        return f"\001{C.CYAN}\002tmns-rtsp> \001{C.RESET}\002"
+    return "tmns-rtsp> "
+
+
+def _print_interactive_help(uri: str, transport: str, args, session) -> None:
+    cprint("Commands:", C.BOLD)
+    for name, argspec, desc in INTERACTIVE_COMMANDS:
+        left = f"{name} {argspec}".strip()
+        cprint(f"  {left:<24} {desc}", C.DIM)
+    cprint("\nTypical flow:", C.BOLD)
+    cprint("  options -> setup -> play [secs] -> pause -> teardown", C.DIM)
+    cprint("\nCurrent context:", C.BOLD)
+    dch = f"{args.lower} client_port={args.client_port}"
+    cprint(f"  uri       : {uri}", C.DIM)
+    cprint(f"  transport : {transport}", C.DIM)
+    cprint(f"  data      : {dch}  (from CLI flags)", C.DIM)
+    cprint(f"  session   : {session or '<none — run setup first>'}", C.DIM)
+    cprint("", C.DIM)
+
+
 def _print_sdp(body: bytes) -> None:
     cprint("--- parsed SDP ---", C.BOLD)
     for line in body.decode("iso-8859-1").splitlines():
@@ -1276,14 +1350,17 @@ def cmd_interactive(args) -> int:
     c = RTSPClient(args.host, args.port, args.timeout, verbose=True)
     c.connect()
     data: Optional[DataChannel] = None
-    cprint("Interactive TmNS RTSP session. Commands:", C.BOLD)
-    cprint("  options | describe | setup | play [secs] | pause | teardown", C.DIM)
-    cprint("  record [range] | redirect | announce <sdp>", C.DIM)
-    cprint("  get <param> | set <k> <v> | uri <new-uri> | quit\n", C.DIM)
+    readline = _setup_readline()
+    cprint("Interactive TmNS RTSP session. Type 'help' (or '?') "
+           "for the command list.", C.BOLD)
+    if readline is not None:
+        cprint("Use the up/down arrows to recall previous commands.\n", C.DIM)
+    else:
+        print()
     try:
         while True:
             try:
-                line = input(C.wrap("tmns-rtsp> ", C.CYAN)).strip()
+                line = input(_prompt()).strip()
             except EOFError:
                 break
             if not line:
@@ -1293,6 +1370,8 @@ def cmd_interactive(args) -> int:
             try:
                 if cmd in ("quit", "exit", "q"):
                     break
+                elif cmd in ("help", "?", "h"):
+                    _print_interactive_help(uri, transport, args, c.session)
                 elif cmd == "uri":
                     uri = parts[1]; cprint(f"uri set: {uri}", C.DIM)
                 elif cmd == "options":
@@ -1336,10 +1415,11 @@ def cmd_interactive(args) -> int:
                 elif cmd == "set" and len(parts) >= 3:
                     c.set_parameter(uri, {parts[1]: " ".join(parts[2:])})
                 else:
-                    cprint(f"? unknown command: {cmd}", C.YELLOW)
+                    cprint(f"? unknown command: {cmd}  (type 'help')", C.YELLOW)
             except (RTSPError, OSError) as e:
                 cprint(f"! {e}", C.RED)
     finally:
+        _save_history(readline)
         if data:
             data.close()
         c.close()
