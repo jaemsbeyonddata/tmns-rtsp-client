@@ -138,6 +138,33 @@ def map_to_tmns(pkt: Ch11Packet, mdid_upper: int = 0):
     return mdid, pdid, pkt.body
 
 
+def tmns_timestamp(seconds: int, nanoseconds: int) -> int:
+    """Pack seconds/nanoseconds into a TmNS MessageTimestamp.
+
+    Per Ch.24 24.2.1.9 the MessageTimestamp is the lower 64 bits of the
+    IEEE 1588-2008 time structure: upper 32 bits = seconds, lower 32 = ns.
+    """
+    return ((seconds & 0xFFFFFFFF) << 32) | (nanoseconds & 0xFFFFFFFF)
+
+
+def message_timestamp(pkt: Ch11Packet):
+    """Best-effort MessageTimestamp for a Chapter 11 packet.
+
+    Returns (timestamp, absolute).  Per Appendix 24-A A.1.c(1)d the Chapter 11
+    secondary-header absolute (PTP/1588) time maps to the MessageTimestamp; we
+    read it as u32 LE seconds followed by u32 LE nanoseconds (the IEEE-1588
+    lower-64 layout in Chapter 11's little-endian byte order).  When no
+    secondary header is present there is no absolute time, so we derive a
+    relative timestamp from the 10 MHz Relative Time Counter (100 ns/tick).
+    """
+    if pkt.secondary_time and len(pkt.secondary_time) >= 8:
+        seconds = _u32(pkt.secondary_time, 0)
+        nanoseconds = _u32(pkt.secondary_time, 4)
+        return tmns_timestamp(seconds, nanoseconds), True
+    ns = pkt.rtc * 100
+    return tmns_timestamp(ns // 1_000_000_000, ns % 1_000_000_000), False
+
+
 # Convenience: a few common Chapter 11 data-type names for logging.
 CH11_DATA_TYPE_NAMES = {
     0x00: "Computer-Generated F0 (setup/TMATS)",

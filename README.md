@@ -245,17 +245,30 @@ python3 tmns_rtsp_client.py stream 127.0.0.1 --lower TCP --client-port 6970 \
     --dest-ip 127.0.0.1 --play-seconds 0 --decode --hexdump
 ```
 
-Delivered messages carry the `PlaybackDataFlag`; sequence numbers are a proper
-monotonic per-MDID counter (Ch.26 §26.5.1). `--loop` replays the file
-continuously; `--rate 0` sends as fast as possible. End-of-Data is sent when
-the file is exhausted (unless looping).
+Fidelity of the mapping:
 
-Limitations: a Chapter 11 packet body must fit a single 16-bit `PackageLength`
-(≤ 65,523 bytes of body); larger packets are skipped with a warning (TmNS
-message fragmentation is not implemented). Chapter 11 secondary-header time is
-not decoded into `MessageTimestamp` (the RTC is carried in `PackageTimeDelta`
-and the message timestamp is the send time). The mock streams all packets and
-does not filter by the request URI's MDID list.
+- **Large data types are split across multiple Packages** per Appendix 24-A
+  A.1.d(2): a body larger than the 16-bit `PackageLength` (or than
+  `--max-msg-bytes`) is divided into standard Packages, packed into as many
+  messages as needed — nothing is dropped. `--max-msg-bytes` (default 60000)
+  caps each message so it fits the transport (e.g. lower it toward the MTU for
+  UDP).
+- **Package Flags → PackageStatusFlags** and **secondary-header absolute
+  (PTP) time → MessageTimestamp** (IEEE-1588 lower 64 bits; the RTC is carried
+  in `PackageTimeDelta`, and is used as a relative timestamp when no secondary
+  header is present).
+- **The request URI's MDID list is honored** — only packets whose mapped MDID
+  is requested are streamed (no `&`-list = all MDIDs).
+- Delivered messages carry the `PlaybackDataFlag`; `MessageDefinitionSequence
+  Number` is a monotonic per-MDID counter (Ch.26 §26.5.1). `--loop` replays the
+  file; `--rate 0` sends as fast as possible; End-of-Data is sent when the file
+  is exhausted (unless looping).
+
+Remaining limitation: wire-level TmNSDataMessage **fragmentation** (Ch.26
+§26.5.3) is not used — instead, message size is bounded via the multi-Package
+split above, which is the Appendix 24-A mechanism for oversized data. The
+IEEE-1588 secondary-time byte order is assumed (u32 LE seconds ‖ u32 LE
+nanoseconds); files using other Chapter 11 time formats fall back to the RTC.
 
 ## Notes & limits
 

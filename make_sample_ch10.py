@@ -52,8 +52,12 @@ def build_packet(channel_id, data_type, dtv, seq, body, rtc, secondary=True):
     flags = SECONDARY_FLAG if secondary else 0x00
     sec = b""
     if secondary:
-        # secondary header: 8-byte time + 2 reserved + 2 checksum
-        sectime = struct.pack("<Q", int(time.time() * 1e7))  # 100ns ticks (arbitrary)
+        # secondary header: 8-byte time + 2 reserved + 2 checksum.
+        # Time is IEEE-1588 absolute time (Appendix 24-A "PTP time"): the
+        # lower 64 bits of the 1588 structure, little-endian as u32 seconds
+        # followed by u32 nanoseconds.
+        now = time.time()
+        sectime = struct.pack("<II", int(now), int((now % 1) * 1e9))
         sec_no_ck = sectime + b"\x00\x00"
         sec = sec_no_ck + struct.pack("<H", _checksum16(sec_no_ck))
 
@@ -78,6 +82,10 @@ def main():
     ap.add_argument("-o", "--output", default="sample.ch10")
     ap.add_argument("-n", "--packets", type=int, default=12,
                     help="total number of packets to write (default 12)")
+    ap.add_argument("--big", type=int, metavar="BYTES", default=0,
+                    help="also append one oversized packet with a BYTES-long "
+                         "body (to exercise multi-Package/message splitting), "
+                         "e.g. --big 200000")
     args = ap.parse_args()
 
     seqs = {}
@@ -94,6 +102,14 @@ def main():
             rtc += 100000  # advance the 10 MHz relative time counter
             f.write(build_packet(channel_id, data_type, dtv, seq, body, rtc))
             written += 1
+
+        if args.big:
+            channel_id, data_type, dtv = 0x0040, 0x40, 0x00  # Video F0
+            rtc += 100000
+            big_body = b"BIG Video F0 " + bytes((i % 251) for i in range(args.big))
+            f.write(build_packet(channel_id, data_type, dtv, 0, big_body, rtc))
+            written += 1
+            print(f"(appended one {args.big}-byte body on channel 0x{channel_id:04x})")
 
     print(f"Wrote {written} Chapter 11 packets to {args.output}")
     print("Channels/data types:")

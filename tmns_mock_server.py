@@ -59,9 +59,38 @@ import chapter11
 DATAMSG_HEADER_LEN = 24
 STD_PKG_HEADER_LEN = 12
 MAX_PACKAGE_LEN = 0xFFFF  # PackageLength is 16 bits (Ch.24 24.2.2.1.1)
+OPTIONS_LEN = 28          # constant length of build_options() output
+DEFAULT_MAX_MSG_BYTES = 60000  # keep each TmNSDataMessage under the UDP limit
 
 RANGE_RE = re.compile(
     r"ptp-clock\s*=\s*(start|now|\d+)\s*-\s*(end|now|\d+)?\s*$", re.I)
+
+# MDID list tokens in a TmNS_Request_Defined_URI: &N or &N-M (Ch.26 26.4.1.4)
+MDID_TOKEN_RE = re.compile(r"&(\d+)(?:-(\d+))?")
+
+
+def parse_requested_mdids(uri: str):
+    """Return a list of (lo, hi) MDID intervals from a request URI.
+
+    An empty list means "all MDIDs" (a request with no TmNSlist, per Ch.26
+    26.4.1.4).  Intervals avoid expanding potentially huge ranges.
+    """
+    intervals = []
+    for m in MDID_TOKEN_RE.finditer(uri):
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) else a
+        intervals.append((min(a, b), max(a, b)))
+    return intervals
+
+
+def mdid_requested(intervals, mdid: int) -> bool:
+    return not intervals or any(lo <= mdid <= hi for lo, hi in intervals)
+
+
+def now_timestamp() -> int:
+    """Current time as a TmNS MessageTimestamp (IEEE-1588 lower 64 bits)."""
+    now = time.time()
+    return ((int(now) & 0xFFFFFFFF) << 32) | (int((now % 1) * 1e9) & 0xFFFFFFFF)
 
 
 def _ts_option(kind: int) -> bytes:
@@ -98,7 +127,8 @@ def build_package(pdid: int, measdata: bytes, status: int = 0,
 
 
 def build_datamsg(mdid: int, seq: int, packages=None, options: bytes = b"",
-                  end_of_data: bool = False, playback: bool = False) -> bytes:
+                  end_of_data: bool = False, playback: bool = False,
+                  ts: int = None) -> bytes:
     version = 1
     if end_of_data:
         # empty End-of-Data indicator (Ch.26 26.4.2.2)
@@ -114,7 +144,8 @@ def build_datamsg(mdid: int, seq: int, packages=None, options: bytes = b"",
     owc = len(options) // 4
     word0 = (version << 28) | (owc << 24) | (0 << 16) | (flags & 0xFFFF)
     length = DATAMSG_HEADER_LEN + len(options) + len(payload)
-    ts = int(time.time() * 1e9)
+    if ts is None:
+        ts = now_timestamp()
     header = struct.pack(">IIIIQ", word0, mdid, seq, length, ts)
     return header + options + payload
 
@@ -131,15 +162,18 @@ class Session:
         self.thread = None
         self.bounded = False
         self.last_activity = time.time()
+        self.mdid_intervals = []      # requested MDID filter ([] = all)
 
 
 class MockSource:
     def __init__(self, port, mdid, pdid, rate, session_timeout,
-                 ch10_path=None, mdid_upper=0, loop=False):
+                 ch10_path=None, mdid_upper=0, loop=False,
+                 max_msg_bytes=DEFAULT_MAX_MSG_BYTES):
         self.port = port
         self.mdid = mdid
         self.pdid = pdid
         self.rate = rate
+        self.max_msg_bytes = max_msg_bytes
         self.session_timeout = session_timeout
         self.ch10_path = ch10_path
         self.mdid_upper = mdid_upper
@@ -283,6 +317,9 @@ class MockSource:
                 self._reply(conn, cseq, 457, "Invalid Range")
                 return sess
             sess.bounded = bool(rng) and not rng.rstrip().endswith("-")
+            sess.mdid_intervals = parse_requested_mdids(uri)
+            if sess.mdid_intervals:
+                print(f"[mock] PLAY requesting MDID intervals {sess.mdid_intervals}")
             self._start_stream(sess, addr)
             extra = {"Session": sess.sid}
             if rng:
@@ -376,7 +413,10 @@ class MockSource:
         """Yield synthetic TmNSDataMessages (two Packages each).
 
         Runs until stop; a bounded Range ends the stream with End-of-Data.
+        Honors the request URI's MDID filter (Ch.26 26.4.1.4).
         """
+        if not mdid_requested(sess.mdid_intervals, self.mdid):
+            return                       # configured MDID not requested
         seq = 0
         while not sess.stop.is_set():
             t = time.time()
@@ -391,36 +431,67 @@ class MockSource:
                 # bounded Range: stream ends; run() emits the End-of-Data marker
                 return
 
+    def _split_packages(self, pdid, body, status, time_delta):
+        """Split a Chapter 11 body into standard Packages (Appendix 24-A A.1.d(2)).
+
+        Each Package's payload is <= the 16-bit PackageLength limit and small
+        enough that a message of packages stays under max_msg_bytes.
+        """
+        max_body = min(MAX_PACKAGE_LEN - STD_PKG_HEADER_LEN,
+                       self.max_msg_bytes - DATAMSG_HEADER_LEN - OPTIONS_LEN
+                       - STD_PKG_HEADER_LEN)
+        max_body = max(1, max_body)
+        chunks = [body[i:i + max_body] for i in range(0, len(body), max_body)] \
+            or [b""]
+        return [build_package(pdid, c, status=status, time_delta=time_delta)
+                for c in chunks]
+
+    def _pack_messages(self, mdid, packages, seqs, ts):
+        """Group Packages into TmNSDataMessages within max_msg_bytes; yield bytes.
+
+        MessageDefinitionSequenceNumber is a monotonic per-MDID counter
+        (Ch.26 26.5.1), which supersedes the appendix's notional
+        "Ch11 seq -> low 8 bits" guidance. All messages derived from one
+        Chapter 11 packet share the same MessageTimestamp.
+        """
+        group, size = [], DATAMSG_HEADER_LEN + OPTIONS_LEN
+        for pkg in packages:
+            if group and size + len(pkg) > self.max_msg_bytes:
+                seq = seqs.get(mdid, 0); seqs[mdid] = seq + 1
+                yield build_datamsg(mdid, seq, packages=group,
+                                    options=build_options(len(group)),
+                                    playback=True, ts=ts)
+                group, size = [], DATAMSG_HEADER_LEN + OPTIONS_LEN
+            group.append(pkg); size += len(pkg)
+        if group:
+            seq = seqs.get(mdid, 0); seqs[mdid] = seq + 1
+            yield build_datamsg(mdid, seq, packages=group,
+                                options=build_options(len(group)),
+                                playback=True, ts=ts)
+
     def _ch10_messages(self, sess):
         """Yield TmNSDataMessages built from a Chapter 11 recording.
 
-        Each Chapter 11 packet body becomes one TmNS Package, mapped per
-        Chapter 24 Appendix 24-A. MessageDefinitionSequenceNumber is a proper
-        monotonic per-MDID counter (Ch.26 26.5.1), which supersedes the
-        appendix's notional "Ch11 seq -> low 8 bits" guidance.
+        Each Chapter 11 packet is mapped per Chapter 24 Appendix 24-A: the body
+        becomes one or more standard Packages (split across Packages/messages
+        when it exceeds the 16-bit PackageLength or max_msg_bytes), the Packet
+        Flags map to PackageStatusFlags, and the secondary-header absolute time
+        maps to MessageTimestamp. The request URI's MDID list filters output.
         """
         seqs = {}
-        skipped = 0
         while not sess.stop.is_set():
             with open(self.ch10_path, "rb") as f:
                 for pkt in chapter11.iter_packets(f):
                     if sess.stop.is_set():
                         return
                     mdid, pdid, body = chapter11.map_to_tmns(pkt, self.mdid_upper)
-                    if STD_PKG_HEADER_LEN + len(body) > MAX_PACKAGE_LEN:
-                        skipped += 1
-                        print(f"[mock] skip Ch11 pkt ch={pkt.channel_id} "
-                              f"dtype={chapter11.data_type_name(pkt.data_type)}: "
-                              f"body {len(body)}B exceeds 16-bit PackageLength")
+                    if not mdid_requested(sess.mdid_intervals, mdid):
                         continue
-                    seq = seqs.get(mdid, 0)
-                    seqs[mdid] = seq + 1
-                    pkg = build_package(pdid, body, time_delta=pkt.rtc & 0xFFFFFFFF)
-                    yield build_datamsg(mdid, seq, packages=[pkg],
-                                        options=build_options(1), playback=True)
+                    ts, _abs = chapter11.message_timestamp(pkt)
+                    packages = self._split_packages(
+                        pdid, body, pkt.flags & 0xFF, pkt.rtc & 0xFFFFFFFF)
+                    yield from self._pack_messages(mdid, packages, seqs, ts)
             if not self.loop:
-                if skipped:
-                    print(f"[mock] ({skipped} oversized packet(s) skipped)")
                 return
             # loop: replay the file until stopped (no End-of-Data between loops)
 
@@ -444,10 +515,15 @@ def main():
                          "(lower 16 bits come from the Channel ID; default 0)")
     ap.add_argument("--loop", action="store_true",
                     help="replay the Chapter 11 file continuously until stopped")
+    ap.add_argument("--max-msg-bytes", type=int, default=DEFAULT_MAX_MSG_BYTES,
+                    help="cap each TmNSDataMessage size; larger Chapter 11 bodies "
+                         "are split across Packages/messages "
+                         f"(default {DEFAULT_MAX_MSG_BYTES})")
     args = ap.parse_args()
     MockSource(args.port, args.mdid, args.pdid, args.rate,
                args.session_timeout, ch10_path=args.ch10,
-               mdid_upper=args.mdid_upper, loop=args.loop).serve()
+               mdid_upper=args.mdid_upper, loop=args.loop,
+               max_msg_bytes=args.max_msg_bytes).serve()
 
 
 if __name__ == "__main__":

@@ -595,8 +595,12 @@ def print_decoded(dm: DecodedMessage, hexdump: bool = False) -> None:
     tag = " [END-OF-DATA]" if h.end_of_data else ""
     pb = "playback" if h.playback else "live"
     trunc = " [TRUNCATED]" if dm.truncated else ""
+    # MessageTimestamp is the lower 64 bits of the IEEE-1588 structure:
+    # upper 32 bits = seconds, lower 32 = nanoseconds (Ch.24 24.2.1.9).
+    ts_sec = h.timestamp >> 32
+    ts_nsec = h.timestamp & 0xFFFFFFFF
     cprint(f"  msg mdid={h.mdid} seq={h.seq} len={h.length} v={h.version} "
-           f"flags=0x{h.flags:04x} ({pb}) ts={h.timestamp}"
+           f"flags=0x{h.flags:04x} ({pb}) ts={ts_sec}.{ts_nsec:09d}"
            f"{tag}{trunc}", C.MAGENTA)
     if dm.options:
         cprint("    options: " + ", ".join(o.describe() for o in dm.options), C.DIM)
