@@ -201,3 +201,15 @@ With `--decode`, each received `TmNSDataMessage` is broken down:
 bit 0 = `EndOfDataFlag`. Add `--hexdump` to also dump the MeasurementData
 bytes, and `--decode-limit N` to cap how many messages are printed (`0` =
 unlimited).
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and
+[NOTICE](NOTICE).
+
+Copyright 2026 James Y.
+
+This licenses the tool's source code only; it does not cover the RCC/IRIG 106
+standard documents, which are published separately by the Range Commanders
+Council (DISTRIBUTION A: approved for public release) and are only referenced
+here, not redistributed.
