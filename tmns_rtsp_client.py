@@ -87,6 +87,23 @@ def cprint(s, color=C.RESET):
     print(C.wrap(s, color))
 
 
+def human_bytes(n: float) -> str:
+    """Human-readable byte count (binary units)."""
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    f = float(n)
+    i = 0
+    while f >= 1024.0 and i < len(units) - 1:
+        f /= 1024.0
+        i += 1
+    return f"{int(n)} B" if i == 0 else f"{f:.2f} {units[i]}"
+
+
+def fmt_hms(seconds: float) -> str:
+    """Format a duration as H:MM:SS."""
+    s = int(seconds)
+    return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
 # ----- RTSP response model ------------------------------------------------
 
 @dataclass
@@ -608,6 +625,7 @@ class DataStats:
     end_of_data: bool = False
     gaps: int = 0
     packages: int = 0
+    elapsed: float = 0.0
     by_mdid: Dict[int, int] = field(default_factory=dict)
     by_pdid: Dict[int, int] = field(default_factory=dict)
     # per-MDID last sequence number (MessageDefinitionSequenceNumber is
@@ -631,6 +649,26 @@ class DataStats:
             self._last_seq[m.mdid] = m.seq
         else:
             self.end_of_data = True
+
+
+def print_play_summary(stats: DataStats, title: str = "PLAY summary") -> None:
+    """Print the final statistics of a completed (or interrupted) PLAY."""
+    el = stats.elapsed or 0.0
+    avg_rate = stats.messages / el if el > 0 else 0.0
+    avg_bw = stats.bytes / el if el > 0 else 0.0
+    cprint(f"\n==== {title} ====", C.BOLD)
+    cprint(f"  duration      : {fmt_hms(el)}  ({el:.1f} s)")
+    cprint(f"  messages      : {stats.messages:,}  (avg {avg_rate:,.1f} msg/s)")
+    cprint(f"  data          : {human_bytes(stats.bytes)}  "
+           f"(avg {human_bytes(avg_bw)}/s)")
+    cprint(f"  packages      : {stats.packages:,}")
+    cprint(f"  MDIDs         : {dict(sorted(stats.by_mdid.items()))}")
+    if stats.by_pdid:
+        cprint(f"  PDIDs         : {dict(sorted(stats.by_pdid.items()))}")
+    cprint(f"  sequence gaps : {stats.gaps}",
+           C.YELLOW if stats.gaps else C.RESET)
+    cprint(f"  end-of-data   : {'yes' if stats.end_of_data else 'no'}",
+           C.GREEN if stats.end_of_data else C.YELLOW)
 
 
 class DataChannel:
@@ -669,40 +707,103 @@ class DataChannel:
             if self.verbose:
                 cprint(f"* Data channel: TCP listening on :{self.client_port}", C.DIM)
 
-    def receive(self, duration: float) -> DataStats:
+    def receive(self, duration: Optional[float] = None,
+                stats_interval: float = 0.0,
+                keepalive=None, keepalive_interval: Optional[float] = None
+                ) -> DataStats:
+        """Receive TmNSDataMessages until a deadline or End-of-Data.
+
+        duration           max seconds to receive; None/0 = until End-of-Data
+                           (or the peer closes a TCP data channel, or Ctrl-C).
+        stats_interval     if > 0, print a running statistics line every N sec.
+        keepalive          optional zero-arg callable invoked every
+                           keepalive_interval seconds (e.g. an RTSP
+                           GET_PARAMETER) to keep the session alive on a long
+                           PLAY; failures are reported but do not stop receive.
+        """
         stats = DataStats()
-        deadline = time.time() + duration
+        start = time.time()
+        hard_deadline = start + duration if duration and duration > 0 else None
         sel = selectors.DefaultSelector()
         if self.lower == "UDP":
-            sel.register(self.sock, selectors.EVENT_READ)
-            while time.time() < deadline and not stats.end_of_data:
-                for _ in sel.select(timeout=min(0.5, max(0.0, deadline - time.time()))):
-                    data, _addr = self.sock.recvfrom(65536)
-                    self._consume_datagram(data, stats)
-        else:
-            # wait for the source to connect, then read stream
-            sel.register(self.sock, selectors.EVENT_READ)
-            accepted = False
-            streambuf = b""
-            while time.time() < deadline and not stats.end_of_data:
-                for key, _ in sel.select(timeout=min(0.5, max(0.0, deadline - time.time()))):
-                    if not accepted and key.fileobj is self.sock:
+            sel.register(self.sock, selectors.EVENT_READ, data="udp")
+        else:  # TCP: wait for the source to connect, then read the stream
+            sel.register(self.sock, selectors.EVENT_READ, data="listen")
+        streambuf = b""
+        last_stats = start
+        last_ka = start
+        prev = (start, 0, 0)   # (t, messages, bytes) snapshot for interval rate
+        try:
+            while not stats.end_of_data:
+                now = time.time()
+                if hard_deadline and now >= hard_deadline:
+                    break
+                timeout = self._select_timeout(now, hard_deadline, last_stats,
+                                               stats_interval, last_ka,
+                                               keepalive, keepalive_interval)
+                for key, _ in sel.select(timeout=timeout):
+                    tag = key.data
+                    if tag == "udp":
+                        data, _addr = self.sock.recvfrom(65536)
+                        self._consume_datagram(data, stats)
+                    elif tag == "listen":
                         self.conn, addr = self.sock.accept()
                         self.conn.setblocking(False)
                         sel.unregister(self.sock)
-                        sel.register(self.conn, selectors.EVENT_READ)
-                        accepted = True
+                        sel.register(self.conn, selectors.EVENT_READ, data="tcp")
                         if self.verbose:
                             cprint(f"* Data source connected from {addr}", C.DIM)
-                    else:
+                    elif tag == "tcp":
                         chunk = self.conn.recv(65536)
                         if not chunk:
-                            stats.end_of_data = stats.end_of_data or True
+                            stats.end_of_data = True
                             break
                         streambuf += chunk
                         streambuf = self._consume_stream(streambuf, stats)
-        sel.close()
+
+                now = time.time()
+                if stats_interval > 0 and now - last_stats >= stats_interval:
+                    self._print_progress(stats, start, now, prev)
+                    prev = (now, stats.messages, stats.bytes)
+                    last_stats = now
+                if (keepalive and keepalive_interval
+                        and now - last_ka >= keepalive_interval):
+                    try:
+                        keepalive()
+                    except (RTSPError, OSError) as e:
+                        cprint(f"! keep-alive failed: {e}", C.YELLOW)
+                    last_ka = now
+        except KeyboardInterrupt:
+            cprint("\n* interrupted -- stopping data reception", C.YELLOW)
+        finally:
+            sel.close()
+        stats.elapsed = time.time() - start
         return stats
+
+    @staticmethod
+    def _select_timeout(now, hard_deadline, last_stats, stats_interval,
+                        last_ka, keepalive, keepalive_interval) -> float:
+        """Wake up in time for the next deadline/stats/keep-alive event."""
+        waits = [1.0]
+        if hard_deadline:
+            waits.append(hard_deadline - now)
+        if stats_interval > 0:
+            waits.append(last_stats + stats_interval - now)
+        if keepalive and keepalive_interval:
+            waits.append(last_ka + keepalive_interval - now)
+        return max(0.0, min(waits))
+
+    def _print_progress(self, stats: DataStats, start: float, now: float,
+                        prev) -> None:
+        elapsed = now - start
+        dt = now - prev[0]
+        inst_rate = (stats.messages - prev[1]) / dt if dt > 0 else 0.0
+        inst_bw = (stats.bytes - prev[2]) / dt if dt > 0 else 0.0
+        eod = " EOD" if stats.end_of_data else ""
+        cprint(f"  [{fmt_hms(elapsed)}] msgs={stats.messages:,} "
+               f"({inst_rate:,.0f}/s) data={human_bytes(stats.bytes)} "
+               f"({human_bytes(inst_bw)}/s) pkgs={stats.packages:,} "
+               f"mdids={len(stats.by_mdid)} gaps={stats.gaps}{eod}", C.BLUE)
 
     def _consume_datagram(self, data: bytes, stats: DataStats) -> None:
         dm = decode_datamsg(data)
@@ -770,7 +871,8 @@ class ConformanceTester:
     def __init__(self, client: RTSPClient, uri: str, transport: str,
                  data_lower: str, client_port: int, play_seconds: float,
                  prange: Optional[str], decode: bool = False,
-                 hexdump: bool = False, check_timeout: bool = False):
+                 hexdump: bool = False, check_timeout: bool = False,
+                 stats_interval: float = 0.0, keepalive_arg=None):
         self.c = client
         self.uri = uri
         self.transport = transport
@@ -781,6 +883,8 @@ class ConformanceTester:
         self.decode = decode
         self.hexdump = hexdump
         self.check_timeout = check_timeout
+        self.stats_interval = stats_interval
+        self.keepalive_arg = keepalive_arg
         self.results: List[TestResult] = []
 
     def _reconnect(self) -> None:
@@ -916,8 +1020,14 @@ class ConformanceTester:
                 self._add("PLAY requires an active Session",
                           self.c.session is not None, self.c.session or "missing")
                 if play_ok:
-                    cprint(f"* Receiving data for {self.play_seconds:g}s ...", C.DIM)
-                    stats = data.receive(self.play_seconds)
+                    dur = self.play_seconds if self.play_seconds > 0 else None
+                    ka, ka_int = make_keepalive(self.c, self.uri, self.keepalive_arg)
+                    cprint("* Receiving data "
+                           + (f"for {self.play_seconds:g}s ..." if dur
+                              else "until End-of-Data ..."), C.DIM)
+                    stats = data.receive(dur, stats_interval=self.stats_interval,
+                                         keepalive=ka, keepalive_interval=ka_int)
+                    print_play_summary(stats)
                     self._add("Data received on data channel", stats.messages > 0,
                               f"{stats.messages} msgs, {stats.bytes} bytes, "
                               f"mdids={sorted(stats.by_mdid)}")
@@ -1002,6 +1112,35 @@ def add_decode_args(p: argparse.ArgumentParser) -> None:
                    help="max messages to print decoded (0 = unlimited; default 10)")
 
 
+def add_receive_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--stats-interval", type=float, default=10.0,
+                   help="seconds between running-statistics lines during PLAY "
+                        "(0 = off; default 10)")
+    p.add_argument("--keepalive", type=float, default=None,
+                   help="send an RTSP keep-alive (GET_PARAMETER) every N seconds "
+                        "during PLAY; 0 = off; omit = auto (session_timeout/2). "
+                        "Recommended for long playbacks.")
+
+
+def make_keepalive(client: "RTSPClient", uri: str, arg):
+    """Build (callable, interval) for periodic session keep-alives.
+
+    arg: None = auto (use session_timeout/2 if the server advertised one),
+    0 = disabled, >0 = explicit interval in seconds.
+    """
+    if arg == 0:
+        return None, None
+    if arg is not None and arg > 0:
+        interval = float(arg)
+    elif client.session_timeout:
+        # half the advertised timeout keeps the session alive with margin;
+        # floor at 1s so a tiny server timeout still gets a timely keep-alive.
+        interval = max(1.0, client.session_timeout / 2.0)
+    else:
+        return None, None
+    return (lambda: client.get_parameter(uri)), interval
+
+
 def resolve_uri(args) -> str:
     if getattr(args, "uri", None):
         return args.uri
@@ -1035,6 +1174,7 @@ def cmd_test(args) -> int:
             args.play_seconds, args.range,
             decode=args.decode, hexdump=args.hexdump,
             check_timeout=args.check_timeout,
+            stats_interval=args.stats_interval, keepalive_arg=args.keepalive,
         )
         ok = tester.run()
     return 0 if ok else 1
@@ -1060,12 +1200,17 @@ def cmd_stream(args) -> int:
         r = c.play(uri, prange=args.range, speed=args.speed, bandwidth=args.bandwidth)
         cprint(f"PLAY    -> {r.status_code} {r.reason}", C.GREEN if r.ok else C.RED)
         if r.ok:
-            cprint(f"* Receiving for {args.play_seconds:g}s ...", C.DIM)
-            stats = data.receive(args.play_seconds)
-            cprint(f"* {stats.messages} messages, {stats.bytes} bytes, "
-                   f"{stats.packages} packages, mdids={sorted(stats.by_mdid)}, "
-                   f"pdids={sorted(stats.by_pdid)}, gaps={stats.gaps}, "
-                   f"end_of_data={stats.end_of_data}", C.BOLD)
+            dur = args.play_seconds if args.play_seconds > 0 else None
+            ka, ka_int = make_keepalive(c, uri, args.keepalive)
+            cprint("* Receiving "
+                   + (f"for {args.play_seconds:g}s" if dur else "until End-of-Data")
+                   + (f", stats every {args.stats_interval:g}s"
+                      if args.stats_interval > 0 else "")
+                   + (f", keep-alive every {ka_int:g}s" if ka_int else "")
+                   + " ...", C.DIM)
+            stats = data.receive(dur, stats_interval=args.stats_interval,
+                                 keepalive=ka, keepalive_interval=ka_int)
+            print_play_summary(stats)
         r = c.teardown(uri)
         cprint(f"TEARDOWN-> {r.status_code} {r.reason}", C.GREEN if r.ok else C.RED)
         data.close()
@@ -1158,9 +1303,14 @@ def cmd_interactive(args) -> int:
                     c.play(uri, prange=args.range, speed=args.speed, bandwidth=args.bandwidth)
                     if data:
                         secs = float(parts[1]) if len(parts) > 1 else args.play_seconds
-                        stats = data.receive(secs)
-                        cprint(f"* {stats.messages} msgs, {stats.bytes} B, "
-                               f"gaps={stats.gaps}, eod={stats.end_of_data}", C.BOLD)
+                        dur = secs if secs > 0 else None
+                        ka, ka_int = make_keepalive(c, uri, args.keepalive)
+                        cprint("* Receiving "
+                               + (f"for {secs:g}s" if dur else "until End-of-Data")
+                               + " (Ctrl-C to stop) ...", C.DIM)
+                        stats = data.receive(dur, stats_interval=args.stats_interval,
+                                             keepalive=ka, keepalive_interval=ka_int)
+                        print_play_summary(stats)
                 elif cmd == "pause":
                     c.pause(uri)
                 elif cmd == "teardown":
@@ -1216,9 +1366,10 @@ def main(argv=None) -> int:
     # test
     pt = sub.add_parser("test", help="run the TmNS RTSP conformance suite")
     add_common_target_args(pt); add_uri_args(pt); add_transport_args(pt)
-    add_decode_args(pt)
+    add_decode_args(pt); add_receive_args(pt)
     pt.add_argument("--play-seconds", type=float, default=5.0,
-                    help="seconds to receive data during PLAY (default 5)")
+                    help="seconds to receive data during PLAY "
+                         "(0 = until End-of-Data; default 5)")
     pt.add_argument("--range", help="Range header value, e.g. 'ptp-clock=now-'")
     pt.add_argument("--check-timeout", action="store_true",
                     help="also test session-timeout expiry (waits for the timeout)")
@@ -1227,8 +1378,10 @@ def main(argv=None) -> int:
     # stream
     ps = sub.add_parser("stream", help="OPTIONS/SETUP/PLAY/receive/TEARDOWN once")
     add_common_target_args(ps); add_uri_args(ps); add_transport_args(ps)
-    add_decode_args(ps)
-    ps.add_argument("--play-seconds", type=float, default=10.0)
+    add_decode_args(ps); add_receive_args(ps)
+    ps.add_argument("--play-seconds", type=float, default=10.0,
+                    help="seconds to receive data (0 = until End-of-Data; "
+                         "default 10)")
     ps.add_argument("--range", help="Range header, e.g. 'ptp-clock=start-end'")
     ps.add_argument("--speed", type=float, help="Speed header value")
     ps.add_argument("--bandwidth", type=int, help="Bandwidth header value (bps)")
@@ -1251,7 +1404,7 @@ def main(argv=None) -> int:
     # interactive
     pi = sub.add_parser("interactive", help="drive a live control channel by hand")
     add_common_target_args(pi); add_uri_args(pi); add_transport_args(pi)
-    add_decode_args(pi)
+    add_decode_args(pi); add_receive_args(pi)
     pi.add_argument("--play-seconds", type=float, default=5.0)
     pi.add_argument("--range", help="Range header value")
     pi.add_argument("--speed", type=float)

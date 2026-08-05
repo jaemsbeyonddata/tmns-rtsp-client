@@ -112,6 +112,50 @@ python3 tmns_rtsp_client.py stream 10.0.0.5 \
     --lower TCP --client-port 6970 --play-seconds 15
 ```
 
+At the end of the PLAY it prints a **summary** of the data received:
+
+```
+==== PLAY summary ====
+  duration      : 1:00:00  (3600.0 s)
+  messages      : 1,080,000  (avg 300.0 msg/s)
+  data          : 4.21 GiB  (avg 1.20 MiB/s)
+  packages      : 2,160,000
+  MDIDs         : {7: 1080000}
+  PDIDs         : {200: 1080000, 201: 1080000}
+  sequence gaps : 0
+  end-of-data   : yes
+```
+
+### Long / continuous playback
+
+For large datasets that take a long time to transfer (e.g. a bounded
+`ptp-clock=start-end` range that streams for an hour), three options make this
+practical:
+
+| Option | Effect |
+| --- | --- |
+| `--play-seconds 0` | receive **until End-of-Data** instead of a fixed time (Ctrl-C also stops cleanly and still prints the summary) |
+| `--stats-interval N` | print a **running statistics** line every `N` seconds (default 10; `0` disables) |
+| `--keepalive N` | send an RTSP `GET_PARAMETER` keep-alive every `N` seconds so the server doesn't expire the session during the long PLAY. Omit it for **auto** (half the server's advertised session timeout); `0` disables |
+
+```bash
+# Play an entire recorded range to completion, with live stats and keep-alive:
+python3 tmns_rtsp_client.py stream 10.0.0.5 --mdid 1 --lower TCP \
+    --client-port 6970 --dest-ip 10.0.0.9 \
+    --range 'ptp-clock=start-end' --play-seconds 0 --stats-interval 5
+```
+
+Running output looks like:
+
+```
+* Receiving until End-of-Data, stats every 5s, keep-alive every 30s ...
+  [0:00:05] msgs=1,500 (300/s) data=6.05 MiB (1.21 MiB/s) pkgs=3,000 mdids=1 gaps=0
+  [0:00:10] msgs=3,000 (300/s) data=12.1 MiB (1.21 MiB/s) pkgs=6,000 mdids=1 gaps=0
+  ...
+```
+
+These options apply to `stream`, `test`, and `interactive`.
+
 ### `method` — send a single method (stateless, full wire dump)
 
 Supports the full RFC 2326 / TmNS method set. `DESCRIBE` responses are parsed
