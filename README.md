@@ -214,11 +214,22 @@ Either pass a complete `--uri`, or let the tool build a
 ### Transport / data-channel options
 
 `--lower UDP|TCP`, `--cast unicast|multicast`, `--destination`, `--ttl`,
-`--client-port`, `--client-port-hi`.
+`--client-port`, `--client-port-hi`, `--group <mcast>`, `--interface <ip>`.
 
 For **UDP** the client binds `client_port` locally and receives datagrams.
 For **TCP** the client **listens** on `client_port` and the source connects to
 it (per Ch. 26 §26.4.2.1).
+
+**Multicast:** TmNS DataChannels are frequently UDP multicast. If the server
+delivers to a multicast group, the client must **join** that group or the
+kernel silently drops the datagrams (you'll see them in `tcpdump` but the app
+receives nothing). Pass the group with `--group 239.x.y.z` (or a multicast
+`--dest-ip`/`--destination`) so the client joins it; use `--interface <local-ip>`
+to pick the receiving NIC. The client also **adopts the server's SETUP
+`Transport` response** automatically — if the server's reply specifies a
+multicast `destination` or a different `client_port`, the data channel is
+re-opened to match before PLAY (and it warns if the server's lower-transport
+differs from `--lower`).
 
 ## Try it locally with the mock server
 

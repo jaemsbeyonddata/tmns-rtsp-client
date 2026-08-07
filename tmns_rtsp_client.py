@@ -211,6 +211,52 @@ def build_transport(
     return spec
 
 
+def is_multicast(ip: Optional[str]) -> bool:
+    """True if ip is an IPv4 multicast address (224.0.0.0 - 239.255.255.255)."""
+    try:
+        return 224 <= int(ip.split(".")[0]) <= 239
+    except (ValueError, AttributeError, IndexError):
+        return False
+
+
+def _low_port(portspec: Optional[str]) -> Optional[int]:
+    """First port of a 'N' or 'N-M' port spec."""
+    if not portspec:
+        return None
+    try:
+        return int(portspec.split("-")[0])
+    except ValueError:
+        return None
+
+
+def parse_transport(header: Optional[str]) -> Dict[str, str]:
+    """Parse an RTSP Transport header value into a dict.
+
+    Handles the first transport-spec: protocol/profile/lower plus the
+    semicolon parameters (unicast|multicast, destination, source, client_port,
+    server_port, ttl, ...).
+    """
+    d: Dict[str, str] = {}
+    if not header:
+        return d
+    spec = header.split(",")[0].strip()          # first transport-spec
+    fields = spec.split(";")
+    proto = fields[0].split("/")
+    d["protocol"] = proto[0].strip() if proto else ""
+    if len(proto) > 1:
+        d["profile"] = proto[1].strip()
+    if len(proto) > 2:
+        d["lower"] = proto[2].strip().upper()
+    for f in fields[1:]:
+        f = f.strip()
+        if f in ("unicast", "multicast"):
+            d["cast"] = f
+        elif "=" in f:
+            k, v = f.split("=", 1)
+            d[k.strip().lower()] = v.strip()
+    return d
+
+
 # ----- RTSP client --------------------------------------------------------
 
 class RTSPError(Exception):
@@ -701,13 +747,17 @@ class DataChannel:
 
     def __init__(self, lower: str, client_port: int, verbose: bool = False,
                  decode: bool = False, hexdump: bool = False,
-                 decode_limit: int = 10):
+                 decode_limit: int = 10, group: Optional[str] = None,
+                 interface: Optional[str] = None):
         self.lower = lower.upper()
         self.client_port = client_port
         self.verbose = verbose
         self.decode = decode or hexdump
         self.hexdump = hexdump
         self.decode_limit = decode_limit
+        # multicast group to join for UDP reception (None = plain unicast)
+        self.group = group if is_multicast(group) else None
+        self.interface = interface       # local IP for the multicast join/bind
         self._decoded_shown = 0
         self.sock: Optional[socket.socket] = None
         self.conn: Optional[socket.socket] = None
@@ -716,8 +766,19 @@ class DataChannel:
         if self.lower == "UDP":
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.sock.bind(("0.0.0.0", self.client_port))
-            if self.verbose:
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except (AttributeError, OSError):
+                pass
+            self.sock.bind(("", self.client_port))
+            if self.group:
+                self._join_multicast()
+                if self.verbose:
+                    cprint(f"* Data channel: UDP joined multicast {self.group} "
+                           f"on :{self.client_port}"
+                           + (f" (if {self.interface})" if self.interface else ""),
+                           C.DIM)
+            elif self.verbose:
                 cprint(f"* Data channel: UDP bound on :{self.client_port}", C.DIM)
         else:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -726,6 +787,32 @@ class DataChannel:
             self.sock.listen(1)
             if self.verbose:
                 cprint(f"* Data channel: TCP listening on :{self.client_port}", C.DIM)
+
+    def _join_multicast(self) -> None:
+        """Join the multicast group so the kernel delivers its datagrams here."""
+        grp = socket.inet_aton(self.group)
+        ifc = socket.inet_aton(self.interface) if self.interface \
+            else socket.inet_aton("0.0.0.0")
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                             grp + ifc)          # struct ip_mreq
+
+    def reconfigure(self, group: Optional[str] = None,
+                    client_port: Optional[int] = None) -> bool:
+        """Adopt a server-specified group/port (UDP). Call before PLAY.
+
+        Returns True if the data channel was re-opened with new settings.
+        """
+        if self.lower != "UDP":
+            return False
+        new_group = group if is_multicast(group) else self.group
+        new_port = client_port or self.client_port
+        if new_group == self.group and new_port == self.client_port:
+            return False
+        self.close()
+        self.group = new_group
+        self.client_port = new_port
+        self.open()
+        return True
 
     def receive(self, duration: Optional[float] = None,
                 stats_interval: float = 0.0,
@@ -1121,6 +1208,11 @@ def add_transport_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--client-port", type=int, default=6970,
                    help="local data-channel port (default 6970)")
     p.add_argument("--client-port-hi", type=int, help="high end of client_port range")
+    p.add_argument("--group", help="multicast group to join for UDP reception "
+                   "(if the server delivers to a multicast address); also sets "
+                   "the Transport destination")
+    p.add_argument("--interface", help="local interface IP for the multicast "
+                   "join / data socket (default: any)")
 
 
 def add_decode_args(p: argparse.ArgumentParser) -> None:
@@ -1175,11 +1267,53 @@ def resolve_uri(args) -> str:
 
 
 def resolve_transport(args) -> str:
-    dest = args.destination or (args.dest_ip if getattr(args, "dest_ip", None) else None)
+    dest = (args.destination or getattr(args, "group", None)
+            or (args.dest_ip if getattr(args, "dest_ip", None) else None))
+    cast = "multicast" if is_multicast(dest) else args.cast
     return build_transport(
-        lower=args.lower, cast=args.cast, destination=dest, ttl=args.ttl,
+        lower=args.lower, cast=cast, destination=dest, ttl=args.ttl,
         client_port=args.client_port, client_port_hi=args.client_port_hi,
     )
+
+
+def initial_group(args) -> Optional[str]:
+    """Multicast group to join from the CLI, if any (--group/--destination/--dest-ip)."""
+    for attr in ("group", "destination", "dest_ip"):
+        cand = getattr(args, attr, None)
+        if is_multicast(cand):
+            return cand
+    return None
+
+
+def make_data_channel(args, verbose: Optional[bool] = None) -> "DataChannel":
+    return DataChannel(args.lower, args.client_port,
+                       verbose=args.verbose if verbose is None else verbose,
+                       decode=args.decode, hexdump=args.hexdump,
+                       decode_limit=args.decode_limit,
+                       group=initial_group(args),
+                       interface=getattr(args, "interface", None))
+
+
+def apply_server_transport(data: "DataChannel", client: "RTSPClient",
+                           requested_lower: str) -> None:
+    """Reconcile the data channel with the server's SETUP Transport response.
+
+    Adopts the server's destination (multicast group) and client_port, and
+    warns if the server's lower-transport differs from what we requested.
+    """
+    st = parse_transport(client.server_transport)
+    if not st:
+        return
+    srv_lower = st.get("lower")
+    if srv_lower and srv_lower != requested_lower.upper():
+        cprint(f"! server data transport is {srv_lower} but you requested "
+               f"{requested_lower.upper()}; reception will fail -- re-run with "
+               f"--lower {srv_lower.lower()}", C.YELLOW)
+    if data.reconfigure(group=st.get("destination"),
+                        client_port=_low_port(st.get("client_port"))):
+        where = f"multicast {data.group}" if data.group else "unicast"
+        cprint(f"* adopted server Transport: receiving {where} on "
+               f"UDP :{data.client_port}", C.GREEN)
 
 
 def cmd_test(args) -> int:
@@ -1207,9 +1341,7 @@ def cmd_stream(args) -> int:
         r = c.options(uri)
         cprint(f"OPTIONS -> {r.status_code} {r.reason}  Public: {r.header('public','')}",
                C.GREEN if r.ok else C.RED)
-        data = DataChannel(args.lower, args.client_port, verbose=args.verbose,
-                           decode=args.decode, hexdump=args.hexdump,
-                           decode_limit=args.decode_limit)
+        data = make_data_channel(args)
         data.open()
         r = c.setup(uri, transport)
         cprint(f"SETUP   -> {r.status_code} {r.reason}  Session: {c.session}  "
@@ -1217,6 +1349,7 @@ def cmd_stream(args) -> int:
         if not r.ok:
             data.close()
             return 1
+        apply_server_transport(data, c, args.lower)
         r = c.play(uri, prange=args.range, speed=args.speed, bandwidth=args.bandwidth)
         cprint(f"PLAY    -> {r.status_code} {r.reason}", C.GREEN if r.ok else C.RED)
         if r.ok:
@@ -1420,11 +1553,10 @@ def cmd_interactive(args) -> int:
             c.options(uri)
         elif cmd == "setup":
             close_data()                 # release any previous data channel
-            data = DataChannel(args.lower, args.client_port, verbose=True,
-                               decode=args.decode, hexdump=args.hexdump,
-                               decode_limit=args.decode_limit)
+            data = make_data_channel(args, verbose=True)
             data.open()
             c.setup(uri, transport)
+            apply_server_transport(data, c, args.lower)
         elif cmd == "play":
             c.play(uri, prange=args.range, speed=args.speed, bandwidth=args.bandwidth)
             if data:
