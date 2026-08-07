@@ -234,6 +234,14 @@ tmns-rtsp> config group 239.1.2.3        # multicast group (next setup)
 tmns-rtsp> config                        # list the full context
 ```
 
+**Logging.** Add `--log` on the command line to record everything (RTSP
+requests/responses, warnings, summaries) to a timestamped file
+`rtsp_log_<date>_<time>.txt` (or `--log <file>` for a specific path). In
+interactive mode you can also toggle it at runtime: `log` starts a log,
+`log <file>` logs to a named file, and `log off` stops. Log lines are
+timestamped and stripped of color, so they capture exactly what the server
+sent — handy for diagnosing things like a `CSeq`/header quirk.
+
 The prompt supports line editing and **command history** — use the up/down
 arrows to recall previous commands. History is saved to
 `~/.tmns_rtsp_history`, so it persists across sessions (requires the `readline`

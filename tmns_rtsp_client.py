@@ -87,8 +87,68 @@ class C:
         return f"{color}{s}{cls.RESET}"
 
 
+# ----- optional file logging ----------------------------------------------
+# Everything printed via cprint (wire dumps, status, warnings) is also written
+# to the log file when one is open, without ANSI colors and with a timestamp.
+_log_fh = None
+_log_path = None
+_log_lock = threading.Lock()
+
+
+def open_logfile(path: Optional[str] = None) -> str:
+    """Open (or switch to) a log file; returns the path used."""
+    global _log_fh, _log_path
+    close_logfile()
+    if not path:
+        import datetime as _dt
+        path = _dt.datetime.now().strftime("rtsp_log_%Y%m%d_%H%M%S.txt")
+    fh = open(path, "a", encoding="utf-8")
+    import datetime as _dt
+    fh.write(f"# TmNS RTSP client log — started {_dt.datetime.now().isoformat()}\n")
+    fh.flush()
+    with _log_lock:
+        _log_fh, _log_path = fh, path
+    return path
+
+
+def close_logfile() -> Optional[str]:
+    """Close the current log file; returns its path (or None)."""
+    global _log_fh, _log_path
+    with _log_lock:
+        fh, path = _log_fh, _log_path
+        _log_fh = _log_path = None
+    if fh is not None:
+        try:
+            fh.close()
+        except OSError:
+            pass
+        return path
+    return None
+
+
+def log_path() -> Optional[str]:
+    return _log_path
+
+
+def _log_write(s: str) -> None:
+    if _log_fh is None:
+        return
+    import datetime as _dt
+    ts = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    with _log_lock:
+        if _log_fh is None:
+            return
+        try:
+            for line in str(s).split("\n"):
+                _log_fh.write(f"[{ts}] {line}\n")
+            _log_fh.flush()
+        except (OSError, ValueError):
+            pass
+
+
 def cprint(s, color=C.RESET):
     print(C.wrap(s, color))
+    _log_write(s)
 
 
 def human_bytes(n: float) -> str:
@@ -363,7 +423,9 @@ class RTSPClient:
             # validate CSeq echo
             echoed = resp.header("cseq")
             if echoed is not None and echoed.strip() != str(self.cseq):
-                cprint(f"! CSeq mismatch: sent {self.cseq}, got {echoed}", C.YELLOW)
+                shown = echoed.strip() or "<empty>"
+                cprint(f"! CSeq mismatch: sent {self.cseq}, got {shown!r} "
+                       f"({method} {resp.status_code})", C.YELLOW)
             return resp
 
     def _read_response(self) -> RTSPResponse:
@@ -1200,6 +1262,9 @@ def add_common_target_args(p: argparse.ArgumentParser) -> None:
                    help="socket timeout seconds (default 10)")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="print raw RTSP request/response and per-message data")
+    p.add_argument("--log", nargs="?", const="__AUTO__", default=None, metavar="FILE",
+                   help="also write all messages to a log file "
+                        "(default name rtsp_log_<date>_<time>.txt)")
 
 
 def add_uri_args(p: argparse.ArgumentParser) -> None:
@@ -1488,6 +1553,8 @@ INTERACTIVE_COMMANDS = [
     ("range", "[value]", "show or set the PLAY Range (e.g. range ptp-clock=now-)"),
     ("config", "[key [value]]", "list context vars, or change one (range, speed, "
                                 "bandwidth, lower, client_port, group, ...)"),
+    ("log", "[file|off]", "start logging to a file (auto-named if omitted) or "
+                          "stop with 'log off'"),
     ("quit, exit, q", "", "close the session and exit"),
 ]
 
@@ -1838,6 +1905,16 @@ def cmd_interactive(args) -> int:
                 set_context("range", " ".join(parts[1:]))
             else:
                 cprint(f"  range = {args.range!r}", C.DIM)
+        elif cmd == "log":
+            if len(parts) > 1 and parts[1].lower() in ("off", "stop", "none"):
+                p = close_logfile()
+                cprint(f"* logging stopped ({p})" if p else "* not logging", C.DIM)
+            else:
+                try:
+                    p = open_logfile(parts[1] if len(parts) > 1 else None)
+                    cprint(f"* logging to {p}", C.GREEN)
+                except OSError as e:
+                    cprint(f"! could not open log file: {e}", C.RED)
         elif cmd == "options":
             c.options(uri)
         elif cmd == "setup":
@@ -2037,6 +2114,12 @@ def main(argv=None) -> int:
     pi.set_defaults(func=cmd_interactive)
 
     args = parser.parse_args(argv)
+    if getattr(args, "log", None) is not None:
+        try:
+            p = open_logfile(None if args.log == "__AUTO__" else args.log)
+            cprint(f"* logging to {p}", C.DIM)
+        except OSError as e:
+            cprint(f"! could not open log file: {e}", C.RED)
     try:
         return args.func(args)
     except KeyboardInterrupt:
@@ -2045,6 +2128,8 @@ def main(argv=None) -> int:
     except (RTSPError, OSError, ValueError) as e:
         cprint(f"! error: {e}", C.RED)
         return 2
+    finally:
+        close_logfile()
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ env/
 # Test / tooling artifacts
 *.pcap
 *.log
+rtsp_log_*.txt
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
