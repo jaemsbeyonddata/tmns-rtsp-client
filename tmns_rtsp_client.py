@@ -168,6 +168,22 @@ def fmt_hms(seconds: float) -> str:
     return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
+def compact_ranges(nums) -> str:
+    """Collapse a set of ints into compact ranges, e.g. [1,2,3,7,9,10] -> '1-3,7,9-10'."""
+    nums = sorted(set(nums))
+    if not nums:
+        return "-"
+    out, start, prev = [], nums[0], nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+        else:
+            out.append(str(start) if start == prev else f"{start}-{prev}")
+            start = prev = n
+    out.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(out)
+
+
 # ----- RTSP response model ------------------------------------------------
 
 @dataclass
@@ -764,10 +780,14 @@ class DataStats:
     bytes: int = 0
     end_of_data: bool = False
     gaps: int = 0
+    lost: int = 0                    # estimated missing messages (from seq deltas)
+    dupes: int = 0                   # duplicate/reordered sequence numbers
     packages: int = 0
     elapsed: float = 0.0
     by_mdid: Dict[int, int] = field(default_factory=dict)
     by_pdid: Dict[int, int] = field(default_factory=dict)
+    by_mdid_gaps: Dict[int, int] = field(default_factory=dict)   # gaps per MDID
+    by_mdid_lost: Dict[int, int] = field(default_factory=dict)   # lost per MDID
     # per-MDID last sequence number (MessageDefinitionSequenceNumber is
     # assigned per-MDID, RCC 106 Ch.26 26.5.1)
     _last_seq: Dict[int, int] = field(default_factory=dict)
@@ -782,13 +802,23 @@ class DataStats:
             self.by_pdid[pkg.pdid] = self.by_pdid.get(pkg.pdid, 0) + 1
         # The empty End-of-Data indicator carries mdid=0/seq=0 and is not part
         # of any data sequence, so it never counts toward gap detection.
-        if not m.end_of_data:
-            prev = self._last_seq.get(m.mdid)
-            if prev is not None and m.seq != (prev + 1) & 0xFFFFFFFF:
-                self.gaps += 1
-            self._last_seq[m.mdid] = m.seq
-        else:
+        if m.end_of_data:
             self.end_of_data = True
+            return
+        prev = self._last_seq.get(m.mdid)
+        if prev is not None:
+            diff = (m.seq - prev) & 0xFFFFFFFF     # forward distance (wrap-safe)
+            if diff == 0 or diff > 0x7FFFFFFF:
+                # same seq (duplicate) or a backward jump (reordering)
+                self.dupes += 1
+            elif diff > 1:
+                # forward gap: (diff - 1) messages missing
+                missing = diff - 1
+                self.gaps += 1
+                self.lost += missing
+                self.by_mdid_gaps[m.mdid] = self.by_mdid_gaps.get(m.mdid, 0) + 1
+                self.by_mdid_lost[m.mdid] = self.by_mdid_lost.get(m.mdid, 0) + missing
+        self._last_seq[m.mdid] = m.seq
 
 
 def print_play_summary(stats: DataStats, title: str = "PLAY summary") -> None:
@@ -802,11 +832,21 @@ def print_play_summary(stats: DataStats, title: str = "PLAY summary") -> None:
     cprint(f"  data          : {human_bytes(stats.bytes)}  "
            f"(avg {human_bytes(avg_bw)}/s)")
     cprint(f"  packages      : {stats.packages:,}")
-    cprint(f"  MDIDs         : {dict(sorted(stats.by_mdid.items()))}")
+    cprint(f"  MDIDs         : {compact_ranges(stats.by_mdid)}  "
+           f"({len(stats.by_mdid)} distinct)")
     if stats.by_pdid:
-        cprint(f"  PDIDs         : {dict(sorted(stats.by_pdid.items()))}")
-    cprint(f"  sequence gaps : {stats.gaps}",
+        cprint(f"  PDIDs         : {compact_ranges(stats.by_pdid)}  "
+               f"({len(stats.by_pdid)} distinct)")
+    cprint(f"  sequence gaps : {stats.gaps}  (est. {stats.lost:,} message(s) lost)",
            C.YELLOW if stats.gaps else C.RESET)
+    if stats.by_mdid_gaps:
+        breakdown = ", ".join(
+            f"{mdid}={stats.by_mdid_gaps[mdid]} gap(s)/"
+            f"{stats.by_mdid_lost.get(mdid, 0)} lost"
+            for mdid in sorted(stats.by_mdid_gaps))
+        cprint(f"  gaps by MDID  : {breakdown}", C.YELLOW)
+    if stats.dupes:
+        cprint(f"  duplicates/reorders : {stats.dupes}", C.YELLOW)
     cprint(f"  end-of-data   : {'yes' if stats.end_of_data else 'no'}",
            C.GREEN if stats.end_of_data else C.YELLOW)
 
@@ -992,7 +1032,8 @@ class DataChannel:
         cprint(f"  [{fmt_hms(elapsed)}] msgs={stats.messages:,} "
                f"({inst_rate:,.0f}/s) data={human_bytes(stats.bytes)} "
                f"({human_bytes(inst_bw)}/s) pkgs={stats.packages:,} "
-               f"mdids={len(stats.by_mdid)} gaps={stats.gaps}{eod}", C.BLUE)
+               f"mdids={len(stats.by_mdid)} gaps={stats.gaps} "
+               f"lost={stats.lost}{eod}", C.BLUE)
 
     def _consume_datagram(self, data: bytes, stats: DataStats) -> None:
         dm = decode_datamsg(data)
@@ -1844,7 +1885,8 @@ def cmd_interactive(args) -> int:
         s = bg["stats"]
         if s is not None:
             cprint(f"  received   : {s.messages:,} msgs, {human_bytes(s.bytes)}, "
-                   f"{s.packages:,} pkgs, gaps={s.gaps}, eod={s.end_of_data}", C.DIM)
+                   f"{s.packages:,} pkgs, gaps={s.gaps}, lost={s.lost}, "
+                   f"eod={s.end_of_data}", C.DIM)
         cprint(f"  CSeq       : {c.cseq}", C.DIM)
 
     def show_context():
@@ -1974,8 +2016,8 @@ def cmd_interactive(args) -> int:
             if bg["stats"] is not None:
                 s = bg["stats"]
                 cprint(f"* {s.messages:,} msgs, {human_bytes(s.bytes)}, "
-                       f"{s.packages:,} pkgs, mdids={sorted(s.by_mdid)}, "
-                       f"gaps={s.gaps}, eod={s.end_of_data}", C.BOLD)
+                       f"{s.packages:,} pkgs, mdids={compact_ranges(s.by_mdid)}, "
+                       f"gaps={s.gaps}, lost={s.lost}, eod={s.end_of_data}", C.BOLD)
             else:
                 cprint("* not receiving (use 'play')", C.YELLOW)
         elif cmd == "stop":

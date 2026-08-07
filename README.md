@@ -122,11 +122,19 @@ At the end of the PLAY it prints a **summary** of the data received:
   messages      : 1,080,000  (avg 300.0 msg/s)
   data          : 4.21 GiB  (avg 1.20 MiB/s)
   packages      : 2,160,000
-  MDIDs         : {7: 1080000}
-  PDIDs         : {200: 1080000, 201: 1080000}
-  sequence gaps : 0
+  MDIDs         : 7  (1 distinct)
+  PDIDs         : 200-201  (2 distinct)
+  sequence gaps : 3  (est. 12 message(s) lost)
+  gaps by MDID  : 7=3 gap(s)/12 lost
+  duplicates/reorders : 0
   end-of-data   : yes
 ```
+
+MDIDs/PDIDs are shown as compact ranges (e.g. `1-4,7`). Sequence gaps are
+detected per-MDID (`MessageDefinitionSequenceNumber`, Ch.26 §26.5.1); the
+**estimated lost-message count** is the sum of the sequence-number deltas
+across gaps, with a per-MDID breakdown. Duplicate or out-of-order sequence
+numbers are counted separately as `duplicates/reorders` (not as loss).
 
 ### Long / continuous playback
 
