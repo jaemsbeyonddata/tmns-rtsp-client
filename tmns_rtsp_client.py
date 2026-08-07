@@ -1555,6 +1555,8 @@ INTERACTIVE_COMMANDS = [
     ("set", "<key> <value...>", "send SET_PARAMETER as 'key: value'"),
     ("uri", "[new-uri]", "show or change the request URI used by later commands"),
     ("range", "[value]", "show or set the PLAY Range (e.g. range ptp-clock=now-)"),
+    ("speed", "[value]", "show or set the PLAY Speed (clears bandwidth)"),
+    ("bandwidth", "[value]", "show or set the PLAY Bandwidth bps (clears speed)"),
     ("config", "[key [value]]", "list context vars, or change one (range, speed, "
                                 "bandwidth, lower, client_port, group, ...)"),
     ("log", "[file|off]", "start logging to a file (auto-named if omitted) or "
@@ -1866,7 +1868,13 @@ def cmd_interactive(args) -> int:
             cprint(f"! {result}", C.RED); return
         setattr(args, key, result)
         note = ""
-        if CONFIG_KEYS[key][1]:                 # affects the Transport header
+        # Speed and Bandwidth are mutually exclusive on PLAY (Ch.26 26.4.1.3):
+        # setting one clears the other so PLAY never carries both.
+        if key == "speed" and result is not None and args.bandwidth is not None:
+            args.bandwidth = None; note = "  (cleared bandwidth; mutually exclusive)"
+        elif key == "bandwidth" and result is not None and args.speed is not None:
+            args.speed = None; note = "  (cleared speed; mutually exclusive)"
+        elif CONFIG_KEYS[key][1]:               # affects the Transport header
             transport = resolve_transport(args)
             note = "  (applies at next 'setup')"
         cprint(f"* {key} = {result!r}{note}", C.DIM)
@@ -1904,11 +1912,11 @@ def cmd_interactive(args) -> int:
                     cprint(f"? unknown config key: {k}", C.YELLOW)
             else:
                 set_context(parts[1], " ".join(parts[2:]))
-        elif cmd == "range":
+        elif cmd in ("range", "speed", "bandwidth"):
             if len(parts) > 1:
-                set_context("range", " ".join(parts[1:]))
+                set_context(cmd, " ".join(parts[1:]))
             else:
-                cprint(f"  range = {args.range!r}", C.DIM)
+                cprint(f"  {cmd} = {getattr(args, cmd)!r}", C.DIM)
         elif cmd == "log":
             if len(parts) > 1 and parts[1].lower() in ("off", "stop", "none"):
                 p = close_logfile()

@@ -180,7 +180,13 @@ for the full command list with parameters plus the current URI/transport/
 session context. Commands: `help`, `status`, `options`, `describe`, `setup`,
 `play [secs]`, `pause`, `resume`, `stats`, `stop`, `teardown`,
 `record [range]`, `redirect`, `announce <sdp>`, `get [param...]`,
-`set <k> <v>`, `uri <new>`, `range <v>`, `config [k [v]]`, `quit`.
+`set <k> <v>`, `uri <new>`, `range <v>`, `speed <v>`, `bandwidth <v>`,
+`config [k [v]]`, `log [file|off]`, `quit`.
+
+The PLAY headers — **Range**, **Speed**, and **Bandwidth** (Ch.26 Table 26-1)
+— each have a shortcut command (and are also settable via `config`); the next
+`play` uses them. Speed and Bandwidth are mutually exclusive, so setting one
+clears the other.
 
 `status` shows the session state at a glance — connection, RTSP state
 (`INIT`/`READY`/`PLAYING`/`PAUSED`), session id and timeout, keep-alive,
