@@ -424,8 +424,12 @@ class RTSPClient:
             echoed = resp.header("cseq")
             if echoed is not None and echoed.strip() != str(self.cseq):
                 shown = echoed.strip() or "<empty>"
-                cprint(f"! CSeq mismatch: sent {self.cseq}, got {shown!r} "
-                       f"({method} {resp.status_code})", C.YELLOW)
+                msg = (f"! CSeq mismatch: sent {self.cseq}, got {shown!r} "
+                       f"({method} {resp.status_code})")
+                if quiet:
+                    _log_write(msg)      # keep background keep-alive off-screen
+                else:
+                    cprint(msg, C.YELLOW)
             return resp
 
     def _read_response(self) -> RTSPResponse:

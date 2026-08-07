@@ -168,7 +168,8 @@ class Session:
 class MockSource:
     def __init__(self, port, mdid, pdid, rate, session_timeout,
                  ch10_path=None, mdid_upper=0, loop=False,
-                 max_msg_bytes=DEFAULT_MAX_MSG_BYTES, no_get_parameter=False):
+                 max_msg_bytes=DEFAULT_MAX_MSG_BYTES, no_get_parameter=False,
+                 gp_405=False):
         self.port = port
         self.mdid = mdid
         self.pdid = pdid
@@ -176,6 +177,7 @@ class MockSource:
         self.max_msg_bytes = max_msg_bytes
         self.session_timeout = session_timeout
         self.no_get_parameter = no_get_parameter
+        self.gp_405 = gp_405
         self.ch10_path = ch10_path
         self.mdid_upper = mdid_upper
         self.loop = loop
@@ -279,6 +281,13 @@ class MockSource:
         # session state (method recognition precedes session validation).
         if method not in known:
             self._reply(conn, cseq, 501, "Not Implemented")
+            return sess
+
+        # Simulate a server that rejects GET_PARAMETER with 405 and (buggily)
+        # omits the CSeq echo -- reproduces the reported keep-alive warning.
+        if method == "GET_PARAMETER" and self.gp_405:
+            conn.sendall(b"RTSP/1.0 405 Method Not Allowed\r\nCSeq: \r\n"
+                         b"Server: TmNS-Mock-Source/1.0\r\n\r\n")
             return sess
 
         # A Session-bearing request (incl. OPTIONS) refreshes the timeout.
@@ -537,12 +546,15 @@ def main():
     ap.add_argument("--no-get-parameter", action="store_true",
                     help="reject GET_PARAMETER with 501 (simulate a server that "
                          "lacks it, to test OPTIONS-based keep-alive)")
+    ap.add_argument("--gp-405", action="store_true",
+                    help="reject GET_PARAMETER with 405 and an empty CSeq echo "
+                         "(reproduces the keep-alive CSeq-mismatch case)")
     args = ap.parse_args()
     MockSource(args.port, args.mdid, args.pdid, args.rate,
                args.session_timeout, ch10_path=args.ch10,
                mdid_upper=args.mdid_upper, loop=args.loop,
                max_msg_bytes=args.max_msg_bytes,
-               no_get_parameter=args.no_get_parameter).serve()
+               no_get_parameter=args.no_get_parameter, gp_405=args.gp_405).serve()
 
 
 if __name__ == "__main__":
