@@ -86,7 +86,8 @@ python3 tmns_rtsp_client.py test 10.0.0.5 \
 **Positive checks:** OPTIONS 2xx; `Public` advertises the five required
 methods; CSeq echo; SETUP 2xx with `Session` + `Transport`; PLAY 2xx with an
 active session; data received on the data channel; no per-MDID sequence gaps;
-PAUSE 2xx; TEARDOWN 2xx.
+PAUSE 2xx; OPTIONS mid-session (keep-alive path) 2xx; a **second PLAY after
+PAUSE** (resume/replay on the same session) 2xx; TEARDOWN 2xx.
 
 **Negative checks:**
 
@@ -167,19 +168,33 @@ Running output looks like:
 
 These options apply to `stream`, `test`, and `interactive`.
 
-### `method` — send a single method (stateless, full wire dump)
+### `method` — run one or more methods on a single session (scriptable)
 
-Supports the full RFC 2326 / TmNS method set. `DESCRIBE` responses are parsed
-and the SDP `m=`/`a=`/`s=` lines are printed.
+Give **one or more** methods; they run in order on a single connection,
+keeping the session (Session id, CSeq, data channel) across them — the
+scriptable counterpart to interactive mode. `SETUP` opens the data channel,
+`PLAY` receives data for `--play-seconds` (0 = until End-of-Data) and prints a
+summary, and `TEARDOWN` ends the sequence. Full wire dump is shown; `DESCRIBE`
+responses are parsed into SDP `m=`/`a=`/`s=` lines.
 
 ```bash
+# single method probe
 python3 tmns_rtsp_client.py method 10.0.0.5 OPTIONS
 python3 tmns_rtsp_client.py method 10.0.0.5 DESCRIBE --mdid 1
+
+# a full flow on one session (SETUP..PLAY..PAUSE..PLAY..TEARDOWN)
+python3 tmns_rtsp_client.py method 10.0.0.5 --mdid 1 --client-port 6970 \
+    --dest-ip 10.0.0.9 --play-seconds 5 \
+    OPTIONS SETUP PLAY PAUSE PLAY TEARDOWN
+
 python3 tmns_rtsp_client.py method 10.0.0.5 GET_PARAMETER --param packets_received
 python3 tmns_rtsp_client.py method 10.0.0.5 SET_PARAMETER --param rate=100
 python3 tmns_rtsp_client.py method 10.0.0.5 ANNOUNCE --body-file stream.sdp
-python3 tmns_rtsp_client.py method 10.0.0.5 RECORD --range 'ptp-clock=now-'
 ```
+
+It accepts the same transport/receive options as `stream` (`--lower`,
+`--client-port`, `--group`, `--range`, `--speed`, `--bandwidth`, `--keepalive`,
+`--decode`, …).
 
 ### `interactive` — drive the control channel by hand
 

@@ -1277,6 +1277,23 @@ class ConformanceTester:
             except RTSPError as e:
                 self._add("PAUSE returns 2xx", False, str(e))
 
+            # 4b. OPTIONS mid-session refreshes/keeps the session (keep-alive path)
+            try:
+                r = self.c.options(self.uri)
+                self._add("OPTIONS mid-session (keep-alive) returns 2xx",
+                          r.ok, f"{r.status_code} {r.reason}")
+            except RTSPError as e:
+                self._add("OPTIONS mid-session (keep-alive) returns 2xx", False, str(e))
+
+            # 4c. Second PLAY after PAUSE (resume/replay on the same session)
+            try:
+                r = self.c.play(self.uri, prange=self.prange)
+                if self._add("Second PLAY after PAUSE returns 2xx (resume)",
+                             r.ok, f"{r.status_code} {r.reason}") and r.ok:
+                    self.c.pause(self.uri)      # settle back to READY before teardown
+            except RTSPError as e:
+                self._add("Second PLAY after PAUSE returns 2xx (resume)", False, str(e))
+
             # 5. TEARDOWN
             try:
                 r = self.c.teardown(self.uri)
@@ -1542,36 +1559,83 @@ def cmd_stream(args) -> int:
 
 
 def cmd_method(args) -> int:
-    """Run a single method (stateless). Supports the full RFC 2326 / TmNS set."""
+    """Run one or more RTSP methods in sequence on a single session.
+
+    Supports the full RFC 2326 / TmNS set including SETUP/PLAY/PAUSE/TEARDOWN.
+    State (Session, CSeq, data channel) is kept across methods; SETUP opens the
+    data channel, PLAY receives data for --play-seconds, and TEARDOWN ends the
+    sequence.  This is the scriptable counterpart to interactive mode, e.g.:
+        method 10.0.0.5 OPTIONS SETUP PLAY PAUSE PLAY TEARDOWN
+    """
     uri = resolve_uri(args)
+    transport = resolve_transport(args)
     body = b""
     if args.body_file:
         with open(args.body_file, "rb") as fh:
             body = fh.read()
     elif args.body:
         body = args.body.encode()
+    methods = [m.upper() for m in args.method]
+    data: Optional[DataChannel] = None
     with RTSPClient(args.host, args.port, args.timeout, verbose=True) as c:
-        method = args.method.upper()
-        if method == "OPTIONS":
-            c.options(uri)
-        elif method == "DESCRIBE":
-            r = c.describe(uri)
-            if r.ok and r.body:
-                _print_sdp(r.body)
-        elif method == "GET_PARAMETER":
-            c.get_parameter(uri, args.param or None)
-        elif method == "SET_PARAMETER":
-            params = dict(kv.split("=", 1) for kv in (args.param or []) if "=" in kv)
-            c.set_parameter(uri, params)
-        elif method == "ANNOUNCE":
-            c.announce(uri, body)
-        elif method == "RECORD":
-            c.record(uri, prange=args.range)
-        elif method == "REDIRECT":
-            c.redirect(uri)
-        else:
-            hdrs = {"Content-Type": args.content_type} if (body and args.content_type) else {}
-            c.request(method, uri, hdrs, body)
+        try:
+            for meth in methods:
+                if meth == "OPTIONS":
+                    c.options(uri)
+                elif meth == "DESCRIBE":
+                    r = c.describe(uri)
+                    if r.ok and r.body:
+                        _print_sdp(r.body)
+                elif meth == "SETUP":
+                    if data:
+                        data.close()
+                    data = make_data_channel(args)
+                    data.open()
+                    c.setup(uri, transport)
+                    apply_server_transport(data, c, args.lower)
+                elif meth == "PLAY":
+                    r = c.play(uri, prange=args.range, speed=args.speed,
+                               bandwidth=args.bandwidth)
+                    if r.ok and data:
+                        dur = args.play_seconds if args.play_seconds > 0 else None
+                        ka, ka_int = make_keepalive(c, uri, args.keepalive,
+                                                    args.keepalive_method)
+                        cprint("* Receiving "
+                               + (f"for {args.play_seconds:g}s" if dur
+                                  else "until End-of-Data")
+                               + " ...", C.DIM)
+                        stats = data.receive(dur, stats_interval=args.stats_interval,
+                                             keepalive=ka, keepalive_interval=ka_int)
+                        print_play_summary(stats)
+                    elif r.ok and not data:
+                        cprint("! PLAY sent but no data channel (run SETUP first)",
+                               C.YELLOW)
+                elif meth == "PAUSE":
+                    c.pause(uri)
+                elif meth == "TEARDOWN":
+                    c.teardown(uri)
+                    if data:
+                        data.close(); data = None
+                    break                       # session ended; stop the sequence
+                elif meth == "GET_PARAMETER":
+                    c.get_parameter(uri, args.param or None)
+                elif meth == "SET_PARAMETER":
+                    params = dict(kv.split("=", 1) for kv in (args.param or [])
+                                  if "=" in kv)
+                    c.set_parameter(uri, params)
+                elif meth == "ANNOUNCE":
+                    c.announce(uri, body)
+                elif meth == "RECORD":
+                    c.record(uri, prange=args.range)
+                elif meth == "REDIRECT":
+                    c.redirect(uri)
+                else:
+                    hdrs = {"Content-Type": args.content_type} \
+                        if (body and args.content_type) else {}
+                    c.request(meth, uri, hdrs, body)
+        finally:
+            if data:
+                data.close()
     return 0
 
 
@@ -2111,8 +2175,10 @@ def main(argv=None) -> int:
   %(prog)s stream 10.0.0.5 --uri 'rtsp://10.0.0.5:55554/TmNS/1.0/&1' \\
       --lower TCP --client-port 6970 --play-seconds 15
 
-  # One-off OPTIONS probe with full wire dump:
+  # Scripted method sequence on one session (OPTIONS probe, or a full flow):
   %(prog)s method 10.0.0.5 OPTIONS
+  %(prog)s method 10.0.0.5 --mdid 1 --client-port 6970 --dest-ip 10.0.0.9 \\
+      OPTIONS SETUP PLAY PAUSE PLAY TEARDOWN --play-seconds 5
 
   # Interactive session:
   %(prog)s interactive 10.0.0.5 --mdid 1
@@ -2144,14 +2210,22 @@ def main(argv=None) -> int:
     ps.set_defaults(func=cmd_stream)
 
     # method
-    pm = sub.add_parser("method", help="send a single RTSP method (stateless)")
-    add_common_target_args(pm); add_uri_args(pm)
-    pm.add_argument("method",
-                    help="OPTIONS|DESCRIBE|SETUP|PLAY|PAUSE|TEARDOWN|"
-                         "GET_PARAMETER|SET_PARAMETER|ANNOUNCE|RECORD|REDIRECT|...")
+    pm = sub.add_parser("method",
+                        help="run one or more RTSP methods on a single session")
+    add_common_target_args(pm); add_uri_args(pm); add_transport_args(pm)
+    add_decode_args(pm); add_receive_args(pm)
+    pm.add_argument("method", nargs="+",
+                    help="one or more methods run in order on one session: "
+                         "OPTIONS DESCRIBE SETUP PLAY PAUSE TEARDOWN "
+                         "GET_PARAMETER SET_PARAMETER ANNOUNCE RECORD REDIRECT")
     pm.add_argument("--param", action="append",
                     help="param name (GET_PARAMETER) or k=v (SET_PARAMETER)")
-    pm.add_argument("--range", help="Range header (RECORD/PLAY)")
+    pm.add_argument("--range", help="Range header (PLAY/RECORD)")
+    pm.add_argument("--speed", type=float, help="Speed header value (PLAY)")
+    pm.add_argument("--bandwidth", type=int, help="Bandwidth header value (PLAY)")
+    pm.add_argument("--play-seconds", type=float, default=5.0,
+                    help="seconds to receive data on PLAY "
+                         "(0 = until End-of-Data; default 5)")
     pm.add_argument("--body", help="raw request body")
     pm.add_argument("--body-file", help="file whose contents form the request body")
     pm.add_argument("--content-type", help="Content-Type for a body")
