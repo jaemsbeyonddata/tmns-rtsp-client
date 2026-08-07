@@ -200,6 +200,10 @@ tmns-rtsp> teardown
 per-message output) — handy for a quick look. Background streaming is quiet by
 design; use `stats` for totals on demand.
 
+Session **keep-alives run silently** (no per-interval RTSP dump cluttering the
+screen); their status appears in `help`/`?` as a `keep-alive:` line, e.g.
+`options every 20s — session alive`.
+
 **Changing the session context at runtime.** `config` (no args) lists every
 context variable; `config <key> <value>` changes one; `uri`/`range` are
 shortcuts. Header/behaviour values (`range`, `speed`, `bandwidth`,

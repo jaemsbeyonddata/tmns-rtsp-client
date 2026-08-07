@@ -319,9 +319,10 @@ class RTSPClient:
     # -- request/response --
     def request(self, method: str, uri: str,
                 headers: Optional[Dict[str, str]] = None,
-                body: bytes = b"") -> RTSPResponse:
+                body: bytes = b"", quiet: bool = False) -> RTSPResponse:
         # One request (send + read) at a time on the shared control socket,
         # so a REPL command and a background keep-alive don't interleave.
+        # quiet suppresses the wire dump (used for background keep-alives).
         with self._lock:
             if self.sock is None:
                 raise RTSPError("not connected")
@@ -341,13 +342,13 @@ class RTSPClient:
                 lines.append(f"{k}: {v}")
             raw = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + body
 
-            if self.verbose:
+            if self.verbose and not quiet:
                 self._dump(raw, outgoing=True)
 
             self.sock.sendall(raw)
             resp = self._read_response()
 
-            if self.verbose:
+            if self.verbose and not quiet:
                 self._dump(resp.raw, outgoing=False)
 
             # capture session id from any response that carries it
@@ -1260,14 +1261,16 @@ def add_receive_args(p: argparse.ArgumentParser) -> None:
 
 
 def _send_keepalive(client: "RTSPClient", uri: str, method: str) -> RTSPResponse:
+    # quiet=True: keep-alives never print a wire dump (they'd flood the REPL)
     if method == "options":
-        return client.options(uri)          # carries the Session header
+        return client.request("OPTIONS", uri, quiet=True)   # carries Session
     if method == "set_parameter":
-        return client.request("SET_PARAMETER", uri)   # empty-body ping
-    return client.get_parameter(uri)
+        return client.request("SET_PARAMETER", uri, quiet=True)
+    return client.request("GET_PARAMETER", uri, quiet=True)
 
 
-def make_keepalive(client: "RTSPClient", uri: str, arg, method: str = "auto"):
+def make_keepalive(client: "RTSPClient", uri: str, arg, method: str = "auto",
+                   status: Optional[dict] = None):
     """Build (callable, interval) for periodic session keep-alives.
 
     A keep-alive is any request carrying the Session header; it refreshes the
@@ -1275,6 +1278,9 @@ def make_keepalive(client: "RTSPClient", uri: str, arg, method: str = "auto"):
     0 = disabled, >0 = explicit seconds.  method selects the request; "auto"
     tries GET_PARAMETER and, if the server answers 501/405 (not implemented),
     switches to OPTIONS -- which every TmNS server must support.
+
+    Keep-alives are silent; the resolved method is recorded in the optional
+    `status` dict (for display in 'help'), not printed.
     """
     if arg == 0:
         return None, None
@@ -1288,6 +1294,9 @@ def make_keepalive(client: "RTSPClient", uri: str, arg, method: str = "auto"):
         return None, None
 
     state = {"method": None if method == "auto" else method}
+    if status is not None:
+        status["interval"] = interval
+        status["method"] = method            # e.g. "auto" until resolved
 
     def ping():
         m = state["method"] or "get_parameter"
@@ -1295,11 +1304,11 @@ def make_keepalive(client: "RTSPClient", uri: str, arg, method: str = "auto"):
         if method == "auto" and state["method"] is None:
             if r is not None and r.status_code in (501, 405):
                 state["method"] = "options"
-                cprint("* keep-alive: server has no GET_PARAMETER; "
-                       "using OPTIONS", C.DIM)
                 _send_keepalive(client, uri, "options")   # refresh now
             else:
                 state["method"] = "get_parameter"
+            if status is not None:
+                status["method"] = state["method"]
 
     return ping, interval
 
@@ -1586,7 +1595,22 @@ def _prompt() -> str:
     return "tmns-rtsp> "
 
 
-def _print_interactive_help(uri: str, transport: str, args, session) -> None:
+def _keepalive_line(args, ka_status) -> str:
+    """One-line keep-alive status for the help/context display."""
+    if ka_status and ka_status.get("active"):
+        m = ka_status.get("method") or "auto"
+        iv = ka_status.get("interval")
+        iv_s = f"{iv:g}s" if iv else "?"
+        return f"{m} every {iv_s} — session alive"
+    if getattr(args, "keepalive", None) == 0:
+        return "off"
+    when = (f"every {args.keepalive:g}s" if getattr(args, "keepalive", None)
+            else "auto (session_timeout/2)")
+    return f"{args.keepalive_method}, {when} (starts at 'play')"
+
+
+def _print_interactive_help(uri: str, transport: str, args, session,
+                            ka_status=None) -> None:
     cprint("Commands:", C.BOLD)
     for name, argspec, desc in INTERACTIVE_COMMANDS:
         left = f"{name} {argspec}".strip()
@@ -1603,6 +1627,7 @@ def _print_interactive_help(uri: str, transport: str, args, session) -> None:
     cprint(f"  data      : {args.lower} client_port={args.client_port}"
            + (f" group={args.group}" if args.group else ""), C.DIM)
     cprint(f"  session   : {session or '<none — run setup first>'}", C.DIM)
+    cprint(f"  keep-alive: {_keepalive_line(args, ka_status)}", C.DIM)
     cprint("", C.DIM)
 
 
@@ -1641,6 +1666,8 @@ def cmd_interactive(args) -> int:
 
     # background-receiver state (lets you pause/resume during streaming)
     bg = {"thread": None, "stop": None, "stats": None, "saved": None}
+    # keep-alive status shown in 'help' (kept off the screen otherwise)
+    ka_status = {"active": False, "interval": None, "method": None}
 
     def bg_active():
         return bg["thread"] is not None and bg["thread"].is_alive()
@@ -1653,7 +1680,9 @@ def cmd_interactive(args) -> int:
         data.decode = False
         bg["stop"] = threading.Event()
         bg["stats"] = DataStats()
-        ka, ka_int = make_keepalive(c, uri, args.keepalive, args.keepalive_method)
+        ka, ka_int = make_keepalive(c, uri, args.keepalive, args.keepalive_method,
+                                    status=ka_status)
+        ka_status["active"] = ka is not None
 
         def run():
             data.receive(duration=None, stats_interval=0.0,
@@ -1672,6 +1701,7 @@ def cmd_interactive(args) -> int:
             data.verbose, data.decode = bg["saved"]
         st = bg["stats"]
         bg["thread"] = bg["stop"] = bg["saved"] = None
+        ka_status["active"] = False
         if summary and st is not None:
             print_play_summary(st)
         bg["stats"] = None
@@ -1720,7 +1750,7 @@ def cmd_interactive(args) -> int:
         if cmd in ("quit", "exit", "q"):
             return "quit"
         elif cmd in ("help", "?", "h"):
-            _print_interactive_help(uri, transport, args, c.session)
+            _print_interactive_help(uri, transport, args, c.session, ka_status)
         elif cmd == "uri":
             if len(parts) > 1:
                 set_context("uri", parts[1])
