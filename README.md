@@ -138,7 +138,8 @@ practical:
 | --- | --- |
 | `--play-seconds 0` | receive **until End-of-Data** instead of a fixed time (Ctrl-C also stops cleanly and still prints the summary) |
 | `--stats-interval N` | print a **running statistics** line every `N` seconds (default 10; `0` disables) |
-| `--keepalive N` | send an RTSP `GET_PARAMETER` keep-alive every `N` seconds so the server doesn't expire the session during the long PLAY. Omit it for **auto** (half the server's advertised session timeout); `0` disables |
+| `--keepalive N` | send an RTSP keep-alive every `N` seconds so the server doesn't expire the session during the long PLAY. Omit it for **auto** (half the server's advertised session timeout); `0` disables |
+| `--keepalive-method` | keep-alive request: `auto` (default — `GET_PARAMETER`, falling back to `OPTIONS` if the server returns 501/405), `options`, `get_parameter`, or `set_parameter`. Use `options` for servers that don't implement `GET_PARAMETER` |
 
 ```bash
 # Play an entire recorded range to completion, with live stats and keep-alive:

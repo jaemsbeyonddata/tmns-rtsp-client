@@ -979,7 +979,8 @@ class ConformanceTester:
                  data_lower: str, client_port: int, play_seconds: float,
                  prange: Optional[str], decode: bool = False,
                  hexdump: bool = False, check_timeout: bool = False,
-                 stats_interval: float = 0.0, keepalive_arg=None):
+                 stats_interval: float = 0.0, keepalive_arg=None,
+                 keepalive_method: str = "auto"):
         self.c = client
         self.uri = uri
         self.transport = transport
@@ -992,6 +993,7 @@ class ConformanceTester:
         self.check_timeout = check_timeout
         self.stats_interval = stats_interval
         self.keepalive_arg = keepalive_arg
+        self.keepalive_method = keepalive_method
         self.results: List[TestResult] = []
 
     def _reconnect(self) -> None:
@@ -1070,7 +1072,8 @@ class ConformanceTester:
             wait = self.c.session_timeout + 3
             cprint(f"* waiting {wait}s for session {self.c.session} to expire ...", C.DIM)
             time.sleep(wait)
-            r = self.c.request("GET_PARAMETER", self.uri)  # keep-alive probe
+            # probe with OPTIONS (mandatory) so this works even without GET_PARAMETER
+            r = self.c.options(self.uri)
             self._add("Session expires after timeout (454)",
                       r.status_code == 454, f"{r.status_code} {r.reason}")
         except (RTSPError, OSError) as e:
@@ -1128,7 +1131,8 @@ class ConformanceTester:
                           self.c.session is not None, self.c.session or "missing")
                 if play_ok:
                     dur = self.play_seconds if self.play_seconds > 0 else None
-                    ka, ka_int = make_keepalive(self.c, self.uri, self.keepalive_arg)
+                    ka, ka_int = make_keepalive(self.c, self.uri, self.keepalive_arg,
+                                                self.keepalive_method)
                     cprint("* Receiving data "
                            + (f"for {self.play_seconds:g}s ..." if dur
                               else "until End-of-Data ..."), C.DIM)
@@ -1229,16 +1233,33 @@ def add_receive_args(p: argparse.ArgumentParser) -> None:
                    help="seconds between running-statistics lines during PLAY "
                         "(0 = off; default 10)")
     p.add_argument("--keepalive", type=float, default=None,
-                   help="send an RTSP keep-alive (GET_PARAMETER) every N seconds "
-                        "during PLAY; 0 = off; omit = auto (session_timeout/2). "
+                   help="send an RTSP keep-alive every N seconds during PLAY; "
+                        "0 = off; omit = auto (session_timeout/2). "
                         "Recommended for long playbacks.")
+    p.add_argument("--keepalive-method",
+                   choices=["auto", "options", "get_parameter", "set_parameter"],
+                   default="auto",
+                   help="keep-alive request method (default auto: GET_PARAMETER, "
+                        "falling back to OPTIONS if the server returns 501/405). "
+                        "Use 'options' for servers without GET_PARAMETER.")
 
 
-def make_keepalive(client: "RTSPClient", uri: str, arg):
+def _send_keepalive(client: "RTSPClient", uri: str, method: str) -> RTSPResponse:
+    if method == "options":
+        return client.options(uri)          # carries the Session header
+    if method == "set_parameter":
+        return client.request("SET_PARAMETER", uri)   # empty-body ping
+    return client.get_parameter(uri)
+
+
+def make_keepalive(client: "RTSPClient", uri: str, arg, method: str = "auto"):
     """Build (callable, interval) for periodic session keep-alives.
 
-    arg: None = auto (use session_timeout/2 if the server advertised one),
-    0 = disabled, >0 = explicit interval in seconds.
+    A keep-alive is any request carrying the Session header; it refreshes the
+    server's session timeout.  arg: None = auto interval (session_timeout/2),
+    0 = disabled, >0 = explicit seconds.  method selects the request; "auto"
+    tries GET_PARAMETER and, if the server answers 501/405 (not implemented),
+    switches to OPTIONS -- which every TmNS server must support.
     """
     if arg == 0:
         return None, None
@@ -1250,7 +1271,22 @@ def make_keepalive(client: "RTSPClient", uri: str, arg):
         interval = max(1.0, client.session_timeout / 2.0)
     else:
         return None, None
-    return (lambda: client.get_parameter(uri)), interval
+
+    state = {"method": None if method == "auto" else method}
+
+    def ping():
+        m = state["method"] or "get_parameter"
+        r = _send_keepalive(client, uri, m)
+        if method == "auto" and state["method"] is None:
+            if r is not None and r.status_code in (501, 405):
+                state["method"] = "options"
+                cprint("* keep-alive: server has no GET_PARAMETER; "
+                       "using OPTIONS", C.DIM)
+                _send_keepalive(client, uri, "options")   # refresh now
+            else:
+                state["method"] = "get_parameter"
+
+    return ping, interval
 
 
 def resolve_uri(args) -> str:
@@ -1329,6 +1365,7 @@ def cmd_test(args) -> int:
             decode=args.decode, hexdump=args.hexdump,
             check_timeout=args.check_timeout,
             stats_interval=args.stats_interval, keepalive_arg=args.keepalive,
+            keepalive_method=args.keepalive_method,
         )
         ok = tester.run()
     return 0 if ok else 1
@@ -1354,7 +1391,7 @@ def cmd_stream(args) -> int:
         cprint(f"PLAY    -> {r.status_code} {r.reason}", C.GREEN if r.ok else C.RED)
         if r.ok:
             dur = args.play_seconds if args.play_seconds > 0 else None
-            ka, ka_int = make_keepalive(c, uri, args.keepalive)
+            ka, ka_int = make_keepalive(c, uri, args.keepalive, args.keepalive_method)
             cprint("* Receiving "
                    + (f"for {args.play_seconds:g}s" if dur else "until End-of-Data")
                    + (f", stats every {args.stats_interval:g}s"
@@ -1562,7 +1599,7 @@ def cmd_interactive(args) -> int:
             if data:
                 secs = float(parts[1]) if len(parts) > 1 else args.play_seconds
                 dur = secs if secs > 0 else None
-                ka, ka_int = make_keepalive(c, uri, args.keepalive)
+                ka, ka_int = make_keepalive(c, uri, args.keepalive, args.keepalive_method)
                 cprint("* Receiving "
                        + (f"for {secs:g}s" if dur else "until End-of-Data")
                        + " (Ctrl-C to stop) ...", C.DIM)

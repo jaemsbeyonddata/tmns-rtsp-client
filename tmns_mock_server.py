@@ -168,13 +168,14 @@ class Session:
 class MockSource:
     def __init__(self, port, mdid, pdid, rate, session_timeout,
                  ch10_path=None, mdid_upper=0, loop=False,
-                 max_msg_bytes=DEFAULT_MAX_MSG_BYTES):
+                 max_msg_bytes=DEFAULT_MAX_MSG_BYTES, no_get_parameter=False):
         self.port = port
         self.mdid = mdid
         self.pdid = pdid
         self.rate = rate
         self.max_msg_bytes = max_msg_bytes
         self.session_timeout = session_timeout
+        self.no_get_parameter = no_get_parameter
         self.ch10_path = ch10_path
         self.mdid_upper = mdid_upper
         self.loop = loop
@@ -261,19 +262,33 @@ class MockSource:
     KNOWN_METHODS = {"OPTIONS", "DESCRIBE", "SETUP", "PLAY", "PAUSE",
                      "TEARDOWN", "GET_PARAMETER"}
 
+    def _touch_session(self, headers):
+        """Any request carrying a live Session id refreshes its timeout."""
+        sid = headers.get("session", "").split(";")[0].strip()
+        if sid and sid in self.sessions:
+            self.sessions[sid].last_activity = time.time()
+
     def _dispatch(self, conn, method, uri, headers, addr, sess):
         cseq = headers.get("cseq", "0")
 
+        known = set(self.KNOWN_METHODS)
+        if self.no_get_parameter:
+            known.discard("GET_PARAMETER")     # simulate a server without it
+
         # Unknown / unimplemented methods are rejected independently of any
         # session state (method recognition precedes session validation).
-        if method not in self.KNOWN_METHODS:
+        if method not in known:
             self._reply(conn, cseq, 501, "Not Implemented")
             return sess
 
+        # A Session-bearing request (incl. OPTIONS) refreshes the timeout.
+        self._touch_session(headers)
+
         if method == "OPTIONS":
-            self._reply(conn, cseq, 200, "OK",
-                        {"Public": "OPTIONS, DESCRIBE, SETUP, TEARDOWN, "
-                                   "PLAY, PAUSE, GET_PARAMETER"})
+            public = "OPTIONS, DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE"
+            if not self.no_get_parameter:
+                public += ", GET_PARAMETER"
+            self._reply(conn, cseq, 200, "OK", {"Public": public})
             return sess
 
         if method == "DESCRIBE":
@@ -519,11 +534,15 @@ def main():
                     help="cap each TmNSDataMessage size; larger Chapter 11 bodies "
                          "are split across Packages/messages "
                          f"(default {DEFAULT_MAX_MSG_BYTES})")
+    ap.add_argument("--no-get-parameter", action="store_true",
+                    help="reject GET_PARAMETER with 501 (simulate a server that "
+                         "lacks it, to test OPTIONS-based keep-alive)")
     args = ap.parse_args()
     MockSource(args.port, args.mdid, args.pdid, args.rate,
                args.session_timeout, ch10_path=args.ch10,
                mdid_upper=args.mdid_upper, loop=args.loop,
-               max_msg_bytes=args.max_msg_bytes).serve()
+               max_msg_bytes=args.max_msg_bytes,
+               no_get_parameter=args.no_get_parameter).serve()
 
 
 if __name__ == "__main__":
