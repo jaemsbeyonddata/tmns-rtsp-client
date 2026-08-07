@@ -178,8 +178,44 @@ python3 tmns_rtsp_client.py method 10.0.0.5 RECORD --range 'ptp-clock=now-'
 Keeps one connection (and session) open. Type `help` (or `?`) at the prompt
 for the full command list with parameters plus the current URI/transport/
 session context. Commands: `help`, `options`, `describe`, `setup`,
-`play [secs]`, `pause`, `teardown`, `record [range]`, `redirect`,
-`announce <sdp>`, `get [param...]`, `set <k> <v>`, `uri <new>`, `quit`.
+`play [secs]`, `pause`, `resume`, `stats`, `stop`, `teardown`,
+`record [range]`, `redirect`, `announce <sdp>`, `get [param...]`,
+`set <k> <v>`, `uri <new>`, `quit`.
+
+**Streaming, pause and resume.** Plain `play` (no seconds) streams in the
+**background** and returns you to the prompt immediately, so you can
+`pause` and then `play` (or `resume`) to control the stream live:
+
+```
+tmns-rtsp> setup
+tmns-rtsp> play            # streams in the background
+tmns-rtsp> stats           # running totals: messages, bytes, packages, gaps
+tmns-rtsp> pause           # server stops sending
+tmns-rtsp> play            # resume
+tmns-rtsp> stop            # stop receiving (keep the session) + print summary
+tmns-rtsp> teardown
+```
+
+`play N` instead does a **foreground** receive for `N` seconds (blocking, with
+per-message output) — handy for a quick look. Background streaming is quiet by
+design; use `stats` for totals on demand.
+
+**Changing the session context at runtime.** `config` (no args) lists every
+context variable; `config <key> <value>` changes one; `uri`/`range` are
+shortcuts. Header/behaviour values (`range`, `speed`, `bandwidth`,
+`keepalive`, `stats_interval`, …) apply to the **next `play`**; transport
+values (`lower`, `cast`, `client_port`, `group`, `interface`, `destination`,
+`ttl`) apply to the **next `setup`**. Use `none` to clear an optional value.
+
+```
+tmns-rtsp> range ptp-clock=start-end     # set the PLAY Range
+tmns-rtsp> config speed 2.0              # 2x
+tmns-rtsp> setup
+tmns-rtsp> play                          # uses the new Range/Speed
+tmns-rtsp> config lower TCP              # switch data transport (next setup)
+tmns-rtsp> config group 239.1.2.3        # multicast group (next setup)
+tmns-rtsp> config                        # list the full context
+```
 
 The prompt supports line editing and **command history** — use the up/down
 arrows to recall previous commands. History is saved to

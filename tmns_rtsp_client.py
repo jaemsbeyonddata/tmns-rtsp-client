@@ -61,6 +61,7 @@ import selectors
 import socket
 import struct
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -275,6 +276,9 @@ class RTSPClient:
         self.session: Optional[str] = None
         self.session_timeout: Optional[int] = None
         self._buf = b""
+        # serializes control-channel access (REPL command vs background
+        # keep-alive share one socket)
+        self._lock = threading.Lock()
         # negotiated data-channel info from the last SETUP transport response
         self.server_transport: Optional[str] = None
 
@@ -316,47 +320,50 @@ class RTSPClient:
     def request(self, method: str, uri: str,
                 headers: Optional[Dict[str, str]] = None,
                 body: bytes = b"") -> RTSPResponse:
-        if self.sock is None:
-            raise RTSPError("not connected")
-        self.cseq += 1
-        hdrs: Dict[str, str] = {}
-        hdrs["CSeq"] = str(self.cseq)
-        hdrs["User-Agent"] = USER_AGENT
-        if self.session:
-            hdrs["Session"] = self.session
-        if headers:
-            hdrs.update(headers)
-        if body:
-            hdrs["Content-Length"] = str(len(body))
+        # One request (send + read) at a time on the shared control socket,
+        # so a REPL command and a background keep-alive don't interleave.
+        with self._lock:
+            if self.sock is None:
+                raise RTSPError("not connected")
+            self.cseq += 1
+            hdrs: Dict[str, str] = {}
+            hdrs["CSeq"] = str(self.cseq)
+            hdrs["User-Agent"] = USER_AGENT
+            if self.session:
+                hdrs["Session"] = self.session
+            if headers:
+                hdrs.update(headers)
+            if body:
+                hdrs["Content-Length"] = str(len(body))
 
-        lines = [f"{method} {uri} RTSP/1.0"]
-        for k, v in hdrs.items():
-            lines.append(f"{k}: {v}")
-        raw = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + body
+            lines = [f"{method} {uri} RTSP/1.0"]
+            for k, v in hdrs.items():
+                lines.append(f"{k}: {v}")
+            raw = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + body
 
-        if self.verbose:
-            self._dump(raw, outgoing=True)
+            if self.verbose:
+                self._dump(raw, outgoing=True)
 
-        self.sock.sendall(raw)
-        resp = self._read_response()
+            self.sock.sendall(raw)
+            resp = self._read_response()
 
-        if self.verbose:
-            self._dump(resp.raw, outgoing=False)
+            if self.verbose:
+                self._dump(resp.raw, outgoing=False)
 
-        # capture session id from any response that carries it
-        sess = resp.header("session")
-        if sess:
-            sid = sess.split(";")[0].strip()
-            self.session = sid
-            m = re.search(r"timeout\s*=\s*(\d+)", sess)
-            if m:
-                self.session_timeout = int(m.group(1))
+            # capture session id from any response that carries it
+            sess = resp.header("session")
+            if sess:
+                sid = sess.split(";")[0].strip()
+                self.session = sid
+                m = re.search(r"timeout\s*=\s*(\d+)", sess)
+                if m:
+                    self.session_timeout = int(m.group(1))
 
-        # validate CSeq echo
-        echoed = resp.header("cseq")
-        if echoed is not None and echoed.strip() != str(self.cseq):
-            cprint(f"! CSeq mismatch: sent {self.cseq}, got {echoed}", C.YELLOW)
-        return resp
+            # validate CSeq echo
+            echoed = resp.header("cseq")
+            if echoed is not None and echoed.strip() != str(self.cseq):
+                cprint(f"! CSeq mismatch: sent {self.cseq}, got {echoed}", C.YELLOW)
+            return resp
 
     def _read_response(self) -> RTSPResponse:
         # read headers up to CRLFCRLF
@@ -816,7 +823,8 @@ class DataChannel:
 
     def receive(self, duration: Optional[float] = None,
                 stats_interval: float = 0.0,
-                keepalive=None, keepalive_interval: Optional[float] = None
+                keepalive=None, keepalive_interval: Optional[float] = None,
+                stop_event=None, stats: Optional[DataStats] = None
                 ) -> DataStats:
         """Receive TmNSDataMessages until a deadline or End-of-Data.
 
@@ -827,8 +835,13 @@ class DataChannel:
                            keepalive_interval seconds (e.g. an RTSP
                            GET_PARAMETER) to keep the session alive on a long
                            PLAY; failures are reported but do not stop receive.
+        stop_event         optional threading.Event; when set, receive returns
+                           (used to stop a background receiver).
+        stats              optional external DataStats to fill (so a caller can
+                           read running totals while receive runs in a thread).
         """
-        stats = DataStats()
+        if stats is None:
+            stats = DataStats()
         start = time.time()
         hard_deadline = start + duration if duration and duration > 0 else None
         sel = selectors.DefaultSelector()
@@ -844,6 +857,8 @@ class DataChannel:
             while not stats.end_of_data:
                 now = time.time()
                 if hard_deadline and now >= hard_deadline:
+                    break
+                if stop_event is not None and stop_event.is_set():
                     break
                 timeout = self._select_timeout(now, hard_deadline, last_stats,
                                                stats_interval, last_ka,
@@ -1447,18 +1462,67 @@ INTERACTIVE_COMMANDS = [
     ("options", "", "send OPTIONS (list supported methods)"),
     ("describe", "", "send DESCRIBE and show the parsed SDP"),
     ("setup", "", "open the data channel and send SETUP"),
-    ("play", "[secs]", "send PLAY and receive data (secs, or 0 = until End-of-Data;"
-                       " default --play-seconds)"),
-    ("pause", "", "send PAUSE"),
+    ("play", "[secs]", "send PLAY; no secs = stream in the background (prompt "
+                       "stays free); secs = receive in the foreground for N s"),
+    ("pause", "", "send PAUSE (server stops sending; 'play' to resume)"),
+    ("resume", "", "resume a paused/background stream (alias for 'play')"),
+    ("stats", "", "show running totals of the background stream"),
+    ("stop", "", "stop the background receiver, keep the session"),
     ("teardown", "", "send TEARDOWN and close the data channel"),
     ("record", "[range]", "send RECORD (e.g. record ptp-clock=now-)"),
     ("redirect", "", "send REDIRECT"),
     ("announce", "<sdp...>", "send ANNOUNCE with the given text as the SDP body"),
     ("get", "[param...]", "send GET_PARAMETER (optional parameter names)"),
     ("set", "<key> <value...>", "send SET_PARAMETER as 'key: value'"),
-    ("uri", "<new-uri>", "change the request URI used by later commands"),
+    ("uri", "[new-uri]", "show or change the request URI used by later commands"),
+    ("range", "[value]", "show or set the PLAY Range (e.g. range ptp-clock=now-)"),
+    ("config", "[key [value]]", "list context vars, or change one (range, speed, "
+                                "bandwidth, lower, client_port, group, ...)"),
     ("quit, exit, q", "", "close the session and exit"),
 ]
+
+# Runtime-configurable interactive context variables (argparse dest name ->
+# (type, affects_transport, help)).  A value of none/-/"" clears it (None).
+CONFIG_KEYS = {
+    "range": (str, False, "PLAY Range header, e.g. ptp-clock=now-"),
+    "speed": (float, False, "PLAY Speed header"),
+    "bandwidth": (int, False, "PLAY Bandwidth header (bps)"),
+    "play_seconds": (float, False, "default foreground play duration (s)"),
+    "keepalive": (float, False, "keep-alive interval (s); 0 = off"),
+    "keepalive_method": (str, False, "auto|options|get_parameter|set_parameter"),
+    "stats_interval": (float, False, "foreground running-stats interval (s)"),
+    "lower": (str, True, "data lower-transport UDP|TCP (next setup)"),
+    "cast": (str, True, "unicast|multicast (next setup)"),
+    "client_port": (int, True, "data-channel port (next setup)"),
+    "client_port_hi": (int, True, "high end of client_port range"),
+    "destination": (str, True, "Transport destination= address (next setup)"),
+    "group": (str, True, "multicast group to join (next setup)"),
+    "interface": (str, True, "local interface IP for multicast (next setup)"),
+    "ttl": (int, True, "Transport ttl= for multicast"),
+}
+
+_CONFIG_CHOICES = {
+    "keepalive_method": {"auto", "options", "get_parameter", "set_parameter"},
+    "lower": {"UDP", "TCP"},
+    "cast": {"unicast", "multicast"},
+}
+
+
+def parse_config_value(key: str, val_str: str):
+    """Parse/validate a config value. Returns (ok, value_or_errmsg)."""
+    typ = CONFIG_KEYS[key][0]
+    if val_str.strip().lower() in ("none", "null", "-", ""):
+        return True, None
+    try:
+        value = typ(val_str)
+    except ValueError:
+        return False, f"invalid {typ.__name__} value: {val_str!r}"
+    if key in _CONFIG_CHOICES:
+        norm = value.upper() if key == "lower" else value
+        if norm not in _CONFIG_CHOICES[key]:
+            return False, f"{key} must be one of {sorted(_CONFIG_CHOICES[key])}"
+        value = norm
+    return True, value
 
 
 _CONN_DEAD_ERRNOS = {
@@ -1528,12 +1592,16 @@ def _print_interactive_help(uri: str, transport: str, args, session) -> None:
         left = f"{name} {argspec}".strip()
         cprint(f"  {left:<24} {desc}", C.DIM)
     cprint("\nTypical flow:", C.BOLD)
-    cprint("  options -> setup -> play [secs] -> pause -> teardown", C.DIM)
-    cprint("\nCurrent context:", C.BOLD)
-    dch = f"{args.lower} client_port={args.client_port}"
+    cprint("  options -> setup -> play -> (pause -> play) -> stop/teardown", C.DIM)
+    cprint("  ('play' streams in the background; use 'play 5' for a quick "
+           "5s foreground look)", C.DIM)
+    cprint("\nCurrent context (change with 'config'/'range'/'uri'):", C.BOLD)
     cprint(f"  uri       : {uri}", C.DIM)
     cprint(f"  transport : {transport}", C.DIM)
-    cprint(f"  data      : {dch}  (from CLI flags)", C.DIM)
+    cprint(f"  range     : {args.range!r}   speed={args.speed!r} "
+           f"bandwidth={args.bandwidth!r}", C.DIM)
+    cprint(f"  data      : {args.lower} client_port={args.client_port}"
+           + (f" group={args.group}" if args.group else ""), C.DIM)
     cprint(f"  session   : {session or '<none — run setup first>'}", C.DIM)
     cprint("", C.DIM)
 
@@ -1571,21 +1639,111 @@ def cmd_interactive(args) -> int:
     else:
         print()
 
+    # background-receiver state (lets you pause/resume during streaming)
+    bg = {"thread": None, "stop": None, "stats": None, "saved": None}
+
+    def bg_active():
+        return bg["thread"] is not None and bg["thread"].is_alive()
+
+    def start_background():
+        # keep totals in bg["stats"]; silence per-message output so the prompt
+        # stays usable (query totals with 'stats')
+        bg["saved"] = (data.verbose, data.decode)
+        data.verbose = False
+        data.decode = False
+        bg["stop"] = threading.Event()
+        bg["stats"] = DataStats()
+        ka, ka_int = make_keepalive(c, uri, args.keepalive, args.keepalive_method)
+
+        def run():
+            data.receive(duration=None, stats_interval=0.0,
+                         keepalive=ka, keepalive_interval=ka_int,
+                         stop_event=bg["stop"], stats=bg["stats"])
+        bg["thread"] = threading.Thread(target=run, daemon=True)
+        bg["thread"].start()
+
+    def stop_background(summary=True):
+        if bg["thread"] is None:
+            return
+        if bg["stop"]:
+            bg["stop"].set()
+        bg["thread"].join(timeout=3.0)
+        if data is not None and bg["saved"]:
+            data.verbose, data.decode = bg["saved"]
+        st = bg["stats"]
+        bg["thread"] = bg["stop"] = bg["saved"] = None
+        if summary and st is not None:
+            print_play_summary(st)
+        bg["stats"] = None
+
     def close_data():
         nonlocal data
+        stop_background(summary=False)
         if data:
             data.close()
             data = None
 
+    def show_context():
+        cprint("Context ('config <key> <value>' to change; 'uri'/'range' too):",
+               C.BOLD)
+        cprint(f"  {'uri':<16} = {uri}", C.DIM)
+        cprint(f"  {'transport':<16} = {transport}", C.DIM)
+        for k, (_typ, _at, hlp) in CONFIG_KEYS.items():
+            cprint(f"  {k:<16} = {getattr(args, k, None)!r:<22} {hlp}", C.DIM)
+
+    def set_context(key, val_str):
+        nonlocal transport, uri
+        key = key.lower().replace("-", "_")
+        if key == "uri":
+            uri = val_str; cprint(f"* uri = {uri}", C.DIM); return
+        if key not in CONFIG_KEYS:
+            cprint(f"? unknown config key: {key}  ('config' lists them)", C.YELLOW)
+            return
+        ok, result = parse_config_value(key, val_str)
+        if not ok:
+            cprint(f"! {result}", C.RED); return
+        setattr(args, key, result)
+        note = ""
+        if CONFIG_KEYS[key][1]:                 # affects the Transport header
+            transport = resolve_transport(args)
+            note = "  (applies at next 'setup')"
+        cprint(f"* {key} = {result!r}{note}", C.DIM)
+
     def handle(cmd, parts):
         """Execute one command. Returns 'quit' to exit, else None."""
         nonlocal data, uri
+        # finalize a background stream that ended on its own (End-of-Data)
+        if bg["thread"] is not None and not bg["thread"].is_alive():
+            cprint("* background receive ended (End-of-Data).", C.DIM)
+            stop_background(summary=True)
+
         if cmd in ("quit", "exit", "q"):
             return "quit"
         elif cmd in ("help", "?", "h"):
             _print_interactive_help(uri, transport, args, c.session)
         elif cmd == "uri":
-            uri = parts[1]; cprint(f"uri set: {uri}", C.DIM)
+            if len(parts) > 1:
+                set_context("uri", parts[1])
+            else:
+                cprint(f"  uri = {uri}", C.DIM)
+        elif cmd in ("config", "cfg", "context", "ctx"):
+            if len(parts) == 1:
+                show_context()
+            elif len(parts) == 2:
+                k = parts[1].lower().replace("-", "_")
+                if k == "uri":
+                    cprint(f"  uri = {uri}", C.DIM)
+                elif k in CONFIG_KEYS:
+                    cprint(f"  {k} = {getattr(args, k, None)!r}", C.DIM)
+                else:
+                    cprint(f"? unknown config key: {k}", C.YELLOW)
+            else:
+                set_context(parts[1], " ".join(parts[2:]))
+        elif cmd == "range":
+            if len(parts) > 1:
+                set_context("range", " ".join(parts[1:]))
+            else:
+                cprint(f"  range = {args.range!r}", C.DIM)
         elif cmd == "options":
             c.options(uri)
         elif cmd == "setup":
@@ -1594,11 +1752,16 @@ def cmd_interactive(args) -> int:
             data.open()
             c.setup(uri, transport)
             apply_server_transport(data, c, args.lower)
-        elif cmd == "play":
+        elif cmd in ("play", "resume"):
+            if not data:
+                cprint("! run 'setup' first", C.YELLOW); return None
             c.play(uri, prange=args.range, speed=args.speed, bandwidth=args.bandwidth)
-            if data:
-                secs = float(parts[1]) if len(parts) > 1 else args.play_seconds
-                dur = secs if secs > 0 else None
+            if bg_active():
+                cprint("* resumed (streaming in background; "
+                       "'stats' / 'pause' / 'stop')", C.DIM)
+            elif cmd == "play" and len(parts) > 1:
+                # foreground bounded receive (blocking) for N seconds
+                secs = float(parts[1]); dur = secs if secs > 0 else None
                 ka, ka_int = make_keepalive(c, uri, args.keepalive, args.keepalive_method)
                 cprint("* Receiving "
                        + (f"for {secs:g}s" if dur else "until End-of-Data")
@@ -1606,9 +1769,32 @@ def cmd_interactive(args) -> int:
                 stats = data.receive(dur, stats_interval=args.stats_interval,
                                      keepalive=ka, keepalive_interval=ka_int)
                 print_play_summary(stats)
+            else:
+                # non-blocking background streaming; prompt returns immediately
+                start_background()
+                cprint("* streaming in background -- 'stats' for totals, "
+                       "'pause' to pause, 'stop'/'teardown' to end", C.GREEN)
         elif cmd == "pause":
             c.pause(uri)
+            if bg_active():
+                cprint("* paused; type 'play' to resume", C.DIM)
+        elif cmd == "stats":
+            if bg["stats"] is not None:
+                s = bg["stats"]
+                cprint(f"* {s.messages:,} msgs, {human_bytes(s.bytes)}, "
+                       f"{s.packages:,} pkgs, mdids={sorted(s.by_mdid)}, "
+                       f"gaps={s.gaps}, eod={s.end_of_data}", C.BOLD)
+            else:
+                cprint("* not receiving (use 'play')", C.YELLOW)
+        elif cmd == "stop":
+            if bg["thread"] is not None:
+                stop_background(summary=True)
+                cprint("* stopped receiving (session still active; 'play' to "
+                       "resume, 'teardown' to end)", C.DIM)
+            else:
+                cprint("* not receiving", C.YELLOW)
         elif cmd == "teardown":
+            stop_background(summary=True)
             c.teardown(uri)
             close_data()
         elif cmd == "record":
