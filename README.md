@@ -177,10 +177,16 @@ python3 tmns_rtsp_client.py method 10.0.0.5 RECORD --range 'ptp-clock=now-'
 
 Keeps one connection (and session) open. Type `help` (or `?`) at the prompt
 for the full command list with parameters plus the current URI/transport/
-session context. Commands: `help`, `options`, `describe`, `setup`,
+session context. Commands: `help`, `status`, `options`, `describe`, `setup`,
 `play [secs]`, `pause`, `resume`, `stats`, `stop`, `teardown`,
 `record [range]`, `redirect`, `announce <sdp>`, `get [param...]`,
-`set <k> <v>`, `uri <new>`, `quit`.
+`set <k> <v>`, `uri <new>`, `range <v>`, `config [k [v]]`, `quit`.
+
+`status` shows the session state at a glance — connection, RTSP state
+(`INIT`/`READY`/`PLAYING`/`PAUSED`), session id and timeout, keep-alive,
+request URI/transport/range, data-channel (transport, port, multicast group,
+open, receiving) and received totals, and the current CSeq. (`stats` is just
+the received-data totals; `status` is the whole session.)
 
 **Streaming, pause and resume.** Plain `play` (no seconds) streams in the
 **background** and returns you to the prompt immediately, so you can
@@ -200,9 +206,16 @@ tmns-rtsp> teardown
 per-message output) — handy for a quick look. Background streaming is quiet by
 design; use `stats` for totals on demand.
 
-Session **keep-alives run silently** (no per-interval RTSP dump cluttering the
-screen); their status appears in `help`/`?` as a `keep-alive:` line, e.g.
-`options every 20s — session alive`.
+**The session is kept alive from `setup` until `teardown`.** A background
+keep-alive thread starts at SETUP and runs continuously — through PLAY, PAUSE,
+End-of-Data, and while idle at the prompt — so the server never times the
+session out. This lets you change the Range (`range …`/`config`) and `play`
+again, repeatedly, on the same session without worrying about the timeout.
+Keep-alives run **silently** (no per-interval RTSP dump); their status shows in
+`help`/`?` and `status` as a `keep-alive:` line, e.g.
+`options every 20s — session alive`. It stops on `teardown`, disconnect, or
+quit. (Set `--keepalive 0` to disable it, or `--keepalive N` to force an
+interval when the server doesn't advertise a timeout.)
 
 **Changing the session context at runtime.** `config` (no args) lists every
 context variable; `config <key> <value>` changes one; `uri`/`range` are

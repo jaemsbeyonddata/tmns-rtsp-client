@@ -1476,6 +1476,7 @@ INTERACTIVE_COMMANDS = [
     ("pause", "", "send PAUSE (server stops sending; 'play' to resume)"),
     ("resume", "", "resume a paused/background stream (alias for 'play')"),
     ("stats", "", "show running totals of the background stream"),
+    ("status", "", "show session state (RTSP state, session, data channel, ...)"),
     ("stop", "", "stop the background receiver, keep the session"),
     ("teardown", "", "send TEARDOWN and close the data channel"),
     ("record", "[range]", "send RECORD (e.g. record ptp-clock=now-)"),
@@ -1666,27 +1667,58 @@ def cmd_interactive(args) -> int:
 
     # background-receiver state (lets you pause/resume during streaming)
     bg = {"thread": None, "stop": None, "stats": None, "saved": None}
+    # persistent session keep-alive (runs from SETUP until TEARDOWN)
+    ka_task = {"thread": None, "stop": None}
     # keep-alive status shown in 'help' (kept off the screen otherwise)
     ka_status = {"active": False, "interval": None, "method": None}
+    # RTSP state machine (RFC 2326): INIT -> READY -> PLAYING/PAUSED
+    sess = {"rtsp": "INIT"}
+
+    def start_session_keepalive():
+        """Keep the RTSP session alive from SETUP until TEARDOWN, independent
+        of PLAY/pause/EoD, so the range can be changed and replayed freely."""
+        stop_session_keepalive()
+        ping, interval = make_keepalive(c, uri, args.keepalive,
+                                        args.keepalive_method, status=ka_status)
+        if ping is None or interval is None:
+            ka_status["active"] = False       # disabled (--keepalive 0 / no timeout)
+            return
+        ev = threading.Event()
+        ka_task["stop"] = ev
+
+        def loop():
+            while not ev.wait(interval):       # fires every `interval` seconds
+                try:
+                    ping()
+                except (RTSPError, OSError):
+                    pass                        # surfaced via the next command
+        ka_task["thread"] = threading.Thread(target=loop, daemon=True)
+        ka_task["thread"].start()
+        ka_status["active"] = True
+
+    def stop_session_keepalive():
+        if ka_task["stop"]:
+            ka_task["stop"].set()
+        if ka_task["thread"]:
+            ka_task["thread"].join(timeout=2.0)
+        ka_task["thread"] = ka_task["stop"] = None
+        ka_status["active"] = False
 
     def bg_active():
         return bg["thread"] is not None and bg["thread"].is_alive()
 
     def start_background():
         # keep totals in bg["stats"]; silence per-message output so the prompt
-        # stays usable (query totals with 'stats')
+        # stays usable (query totals with 'stats').  Keep-alive is handled by
+        # the persistent session keep-alive thread, not the receive loop.
         bg["saved"] = (data.verbose, data.decode)
         data.verbose = False
         data.decode = False
         bg["stop"] = threading.Event()
         bg["stats"] = DataStats()
-        ka, ka_int = make_keepalive(c, uri, args.keepalive, args.keepalive_method,
-                                    status=ka_status)
-        ka_status["active"] = ka is not None
 
         def run():
             data.receive(duration=None, stats_interval=0.0,
-                         keepalive=ka, keepalive_interval=ka_int,
                          stop_event=bg["stop"], stats=bg["stats"])
         bg["thread"] = threading.Thread(target=run, daemon=True)
         bg["thread"].start()
@@ -1712,6 +1744,35 @@ def cmd_interactive(args) -> int:
         if data:
             data.close()
             data = None
+
+    def show_status():
+        cprint("Session status:", C.BOLD)
+        conn = (f"connected to {c.host}:{c.port}" if c.sock is not None
+                else f"not connected ({c.host}:{c.port})")
+        cprint(f"  connection : {conn}", C.DIM)
+        cprint(f"  rtsp state : {sess['rtsp']}", C.DIM)
+        to = f", timeout {c.session_timeout}s" if (c.session and c.session_timeout) else ""
+        cprint(f"  session    : {c.session or '<none — run setup>'}{to}", C.DIM)
+        cprint(f"  keep-alive : {_keepalive_line(args, ka_status)}", C.DIM)
+        cprint(f"  request URI: {uri}", C.DIM)
+        cprint(f"  transport  : {transport}", C.DIM)
+        cprint(f"  range      : {args.range!r}  speed={args.speed!r}  "
+               f"bandwidth={args.bandwidth!r}", C.DIM)
+        if data is not None:
+            dc = f"{data.lower} :{data.client_port}"
+            if data.group:
+                dc += f" group={data.group}"
+            dc += f"  open={'yes' if data.sock is not None else 'no'}"
+            recv = ("paused" if sess["rtsp"] == "PAUSED"
+                    else "background" if bg_active() else "no")
+            cprint(f"  data chan  : {dc}  receiving={recv}", C.DIM)
+        else:
+            cprint("  data chan  : <none — run setup>", C.DIM)
+        s = bg["stats"]
+        if s is not None:
+            cprint(f"  received   : {s.messages:,} msgs, {human_bytes(s.bytes)}, "
+                   f"{s.packages:,} pkgs, gaps={s.gaps}, eod={s.end_of_data}", C.DIM)
+        cprint(f"  CSeq       : {c.cseq}", C.DIM)
 
     def show_context():
         cprint("Context ('config <key> <value>' to change; 'uri'/'range' too):",
@@ -1746,9 +1807,12 @@ def cmd_interactive(args) -> int:
         if bg["thread"] is not None and not bg["thread"].is_alive():
             cprint("* background receive ended (End-of-Data).", C.DIM)
             stop_background(summary=True)
+            sess["rtsp"] = "READY"
 
         if cmd in ("quit", "exit", "q"):
             return "quit"
+        elif cmd == "status":
+            show_status()
         elif cmd in ("help", "?", "h"):
             _print_interactive_help(uri, transport, args, c.session, ka_status)
         elif cmd == "uri":
@@ -1777,35 +1841,44 @@ def cmd_interactive(args) -> int:
         elif cmd == "options":
             c.options(uri)
         elif cmd == "setup":
+            stop_session_keepalive()     # end any prior session's keep-alive
             close_data()                 # release any previous data channel
             data = make_data_channel(args, verbose=True)
             data.open()
-            c.setup(uri, transport)
+            r = c.setup(uri, transport)
             apply_server_transport(data, c, args.lower)
+            if r.ok:
+                sess["rtsp"] = "READY"
+                start_session_keepalive()  # keep alive until TEARDOWN
         elif cmd in ("play", "resume"):
             if not data:
                 cprint("! run 'setup' first", C.YELLOW); return None
-            c.play(uri, prange=args.range, speed=args.speed, bandwidth=args.bandwidth)
+            r = c.play(uri, prange=args.range, speed=args.speed,
+                       bandwidth=args.bandwidth)
+            if r.ok:
+                sess["rtsp"] = "PLAYING"
             if bg_active():
                 cprint("* resumed (streaming in background; "
                        "'stats' / 'pause' / 'stop')", C.DIM)
             elif cmd == "play" and len(parts) > 1:
-                # foreground bounded receive (blocking) for N seconds
+                # foreground bounded receive (blocking) for N seconds; the
+                # persistent keep-alive thread keeps the session alive meanwhile
                 secs = float(parts[1]); dur = secs if secs > 0 else None
-                ka, ka_int = make_keepalive(c, uri, args.keepalive, args.keepalive_method)
                 cprint("* Receiving "
                        + (f"for {secs:g}s" if dur else "until End-of-Data")
                        + " (Ctrl-C to stop) ...", C.DIM)
-                stats = data.receive(dur, stats_interval=args.stats_interval,
-                                     keepalive=ka, keepalive_interval=ka_int)
+                stats = data.receive(dur, stats_interval=args.stats_interval)
                 print_play_summary(stats)
+                sess["rtsp"] = "READY"    # foreground receive finished
             else:
                 # non-blocking background streaming; prompt returns immediately
                 start_background()
                 cprint("* streaming in background -- 'stats' for totals, "
                        "'pause' to pause, 'stop'/'teardown' to end", C.GREEN)
         elif cmd == "pause":
-            c.pause(uri)
+            r = c.pause(uri)
+            if r.ok:
+                sess["rtsp"] = "PAUSED"
             if bg_active():
                 cprint("* paused; type 'play' to resume", C.DIM)
         elif cmd == "stats":
@@ -1819,14 +1892,17 @@ def cmd_interactive(args) -> int:
         elif cmd == "stop":
             if bg["thread"] is not None:
                 stop_background(summary=True)
+                sess["rtsp"] = "READY"
                 cprint("* stopped receiving (session still active; 'play' to "
                        "resume, 'teardown' to end)", C.DIM)
             else:
                 cprint("* not receiving", C.YELLOW)
         elif cmd == "teardown":
+            stop_session_keepalive()
             stop_background(summary=True)
             c.teardown(uri)
             close_data()
+            sess["rtsp"] = "INIT"
         elif cmd == "record":
             c.record(uri, prange=parts[1] if len(parts) > 1 else args.range)
         elif cmd == "redirect":
@@ -1864,7 +1940,9 @@ def cmd_interactive(args) -> int:
                     continue
                 # control connection dropped -- recover transparently
                 cprint(f"! control connection lost ({e})", C.YELLOW)
+                stop_session_keepalive()  # stop before touching the socket
                 close_data()             # session is gone; drop the data channel
+                sess["rtsp"] = "INIT"
                 try:
                     c.reconnect()
                 except OSError as re_err:
@@ -1883,6 +1961,7 @@ def cmd_interactive(args) -> int:
                     cprint("  (re-run 'setup' to start a new stream.)", C.DIM)
     finally:
         _save_history(readline)
+        stop_session_keepalive()
         close_data()
         c.close()
     return 0
