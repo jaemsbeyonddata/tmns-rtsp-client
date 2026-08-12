@@ -26,3 +26,9 @@ rtsp_log_*.txt
 
 # Claude Code local project data
 .claude/
+
+# generated TmNS recordings / Chapter 10 files
+*.tmns
+*.index
+*.ch10
+*.c10

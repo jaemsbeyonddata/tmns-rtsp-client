@@ -58,8 +58,12 @@ word4: MessageTimestamp(64)
 ## Files
 
 - `tmns_rtsp_client.py` — the client / conformance tester.
+- `tmns_rtsp_server.py` — a playback `RTSPDataSource` that serves `.tmns` recordings.
 - `tmns_mock_server.py` — a minimal mock `RTSPDataSource` test fixture.
+- `tmns_message.py` — TmNS message builders + `.tmns`/`.index` record helpers.
+- `make_sample_tmns_message.py` — generate a `.tmns` PCM recording + `.index`.
 - `chapter11.py` — IRIG-106 Chapter 11 packet reader + Appendix 24-A → TmNS mapping.
+- `ch10_to_tmns.py` — wrap a Chapter 10/11 `.ch10` file into a `.tmns` recording.
 - `make_sample_ch10.py` — generates a small valid `.ch10` file for testing.
 
 ## Usage
@@ -335,6 +339,69 @@ python3 tmns_rtsp_client.py test 127.0.0.1 --mdid 7 \
 
 Expected: all checks `PASS`. Use `--range 'ptp-clock=start-end'` to exercise
 the bounded-range End-of-Data path (`end-of-data: yes`).
+
+## Recording playback server (`.tmns` / `.index`)
+
+`tmns_rtsp_server.py` is a fuller `RTSPDataSource` that plays back **recorded**
+TmNSDataMessages from a `.tmns` file, using a `.index` file to binary-search
+the Range on PLAY.
+
+The record/index container (defined in `tmns_message.py`) is purpose-built for
+this project — there is no standardized TmNS record-file format in IRIG-106
+(recordings are normally carried via Chapter 10/11). Its **contents** are
+standard Chapter 24 TmNSDataMessages:
+
+- `.tmns` — a 16-byte header then a sequence of Chapter 24 TmNSDataMessages,
+  each framed by its `MessageLength`.
+- `.index` — a time-ordered table `(MessageTimestamp, file_offset, MDID,
+  MessageLength)` for fast Range search.
+
+Generate a PCM recording and play it back:
+
+```bash
+# make sample.tmns + sample.index (PCM minor frames, IRIG-106 Ch.4 sync)
+python3 make_sample_tmns_message.py -o sample -n 500 --rate 100 --mdid 7 --pdid 2305
+
+# serve it (single pair)
+python3 tmns_rtsp_server.py --tmns sample.tmns --index sample.index --port 55554
+
+# in another terminal, play it back with the client
+python3 tmns_rtsp_client.py stream 127.0.0.1 --mdid 7 --lower UDP \
+    --client-port 6970 --dest-ip 127.0.0.1 --play-seconds 0 --decode
+```
+
+On PLAY the server reads the `Range` (`ptp-clock=start-end`, where `start`/`end`
+resolve to the recording bounds or a PTP timestamp), seeks via the index, and
+streams the matching messages (filtered by the request URI's MDID list),
+ending with End-of-Data. Playback is **real-time** by default (paced from the
+message timestamps; scale with `--speed` or the RTSP `Speed` header, or use
+`--asap` for maximum rate).
+
+**Folder mode** — many recordings, played back in time order, with the `.tmns`
+and `.index` files in separate directories:
+
+```bash
+python3 tmns_rtsp_server.py --tmns-dir recordings/ --index-dir indexes/ --port 55554
+```
+
+Each `X.tmns` is paired with `X.index`; recordings are sorted by start time and
+streamed in order for the requested Range. The server implements the full
+control channel and **passes the 19-check conformance suite**.
+
+### Wrapping Chapter 10/11 into a recording (Appendix 24-A)
+
+`ch10_to_tmns.py` converts an IRIG-106 Chapter 10/11 `.ch10` recording into a
+`.tmns`/`.index` pair by applying the **Chapter 24 Appendix 24-A** mapping
+(Channel ID → MDID, Data Type/Version → PDID, Packet Flags → PackageStatusFlags,
+secondary-header time → MessageTimestamp, packet body → Package payload; large
+bodies split across Packages). The result is served like any other recording:
+
+```bash
+python3 ch10_to_tmns.py flight.ch10 -o flight        # -> flight.tmns + flight.index
+python3 tmns_rtsp_server.py --tmns flight.tmns --index flight.index --port 55554
+```
+
+(The mock server can also play a `.ch10` **live** via `--ch10`; see below.)
 
 ## Chapter 11 playback (Appendix 24-A)
 
