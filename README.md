@@ -204,11 +204,17 @@ It accepts the same transport/receive options as `stream` (`--lower`,
 
 Keeps one connection (and session) open. Type `help` (or `?`) at the prompt
 for the full command list with parameters plus the current URI/transport/
-session context. Commands: `help`, `status`, `options`, `describe`, `setup`,
-`play [secs]`, `pause`, `resume`, `stats`, `stop`, `teardown`,
-`record [range]`, `redirect`, `announce <sdp>`, `get [param...]`,
-`set <k> <v>`, `uri <new>`, `range <v>`, `speed <v>`, `bandwidth <v>`,
-`config [k [v]]`, `log [file|off]`, `quit`.
+session context. Commands: `help`, `status`, `connect`, `disconnect`,
+`options`, `describe`, `setup`, `play [secs]`, `pause`, `resume`, `stats`,
+`stop`, `teardown`, `record [range]`, `redirect`, `announce <sdp>`,
+`get [param...]`, `set <k> <v>`, `uri <new>`, `range <v>`, `speed <v>`,
+`bandwidth <v>`, `config [k [v]]`, `log [file|off]`, `quit`.
+
+The app connects at startup by default. `disconnect` closes the control
+channel from inside the app (the session ends, and the loop **won't**
+auto-reconnect), and `connect` reopens it — useful for testing drops or
+switching a server on/off. (An *unexpected* drop still auto-recovers; a
+deliberate `disconnect` does not.)
 
 The PLAY headers — **Range**, **Speed**, and **Bandwidth** (Ch.26 Table 26-1)
 — each have a shortcut command (and are also settable via `config`); the next

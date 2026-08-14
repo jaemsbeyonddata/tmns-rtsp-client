@@ -1642,6 +1642,8 @@ def cmd_method(args) -> int:
 # (command, argument-spec, description) for the interactive help listing
 INTERACTIVE_COMMANDS = [
     ("help, ?", "", "show this command list"),
+    ("connect", "", "open the control channel (if not connected)"),
+    ("disconnect", "", "close the control channel (session ends; no auto-reconnect)"),
     ("options", "", "send OPTIONS (list supported methods)"),
     ("describe", "", "send DESCRIBE and show the parsed SDP"),
     ("setup", "", "open the data channel and send SETUP"),
@@ -1851,6 +1853,8 @@ def cmd_interactive(args) -> int:
     ka_status = {"active": False, "interval": None, "method": None}
     # RTSP state machine (RFC 2326): INIT -> READY -> PLAYING/PAUSED
     sess = {"rtsp": "INIT"}
+    # set when the user runs 'disconnect' so the loop won't auto-reconnect
+    link = {"manual_disconnect": False}
 
     def start_session_keepalive():
         """Keep the RTSP session alive from SETUP until TEARDOWN, independent
@@ -2033,6 +2037,29 @@ def cmd_interactive(args) -> int:
                     cprint(f"* logging to {p}", C.GREEN)
                 except OSError as e:
                     cprint(f"! could not open log file: {e}", C.RED)
+        elif cmd == "connect":
+            if c.sock is not None:
+                cprint(f"* already connected to {c.host}:{c.port} "
+                       f"(use 'disconnect' first)", C.YELLOW)
+            else:
+                c.session = c.session_timeout = None
+                c._buf = b""
+                try:
+                    c.connect()
+                    link["manual_disconnect"] = False
+                    cprint(f"* connected to {c.host}:{c.port}", C.GREEN)
+                except OSError as e:
+                    cprint(f"! connect to {c.host}:{c.port} failed ({e})", C.RED)
+        elif cmd == "disconnect":
+            stop_session_keepalive()
+            close_data()                 # drops data channel + background receiver
+            c.close()
+            c.session = c.session_timeout = None
+            c._buf = b""
+            sess["rtsp"] = "INIT"
+            link["manual_disconnect"] = True
+            cprint("* disconnected (control channel closed; 'connect' to reopen)",
+                   C.DIM)
         elif cmd == "options":
             c.options(uri)
         elif cmd == "setup":
@@ -2132,6 +2159,11 @@ def cmd_interactive(args) -> int:
             except (RTSPError, OSError) as e:
                 if not _connection_dead(e):
                     cprint(f"! {e}", C.RED)
+                    continue
+                if link["manual_disconnect"]:
+                    # user disconnected on purpose; don't auto-reconnect
+                    cprint("! not connected -- type 'connect' to reopen the "
+                           "control channel", C.YELLOW)
                     continue
                 # control connection dropped -- recover transparently
                 cprint(f"! control connection lost ({e})", C.YELLOW)
