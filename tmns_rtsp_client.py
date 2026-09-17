@@ -162,6 +162,15 @@ def human_bytes(n: float) -> str:
     return f"{int(n)} B" if i == 0 else f"{f:.2f} {units[i]}"
 
 
+def parse_size(text: str) -> int:
+    """argparse type: a byte count, optionally with a K/M/G suffix (binary)."""
+    m = re.fullmatch(r"\s*(\d+)\s*([kmg]?)(?:i?b)?\s*", text, re.I)
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid size {text!r} (e.g. 67108864, 64M)")
+    return int(m.group(1)) * {"": 1, "k": 1 << 10, "m": 1 << 20,
+                              "g": 1 << 30}[m.group(2).lower()]
+
+
 def fmt_hms(seconds: float) -> str:
     """Format a duration as H:MM:SS."""
     s = int(seconds)
@@ -782,6 +791,9 @@ class DataStats:
     gaps: int = 0
     lost: int = 0                    # estimated missing messages (from seq deltas)
     dupes: int = 0                   # duplicate/reordered sequence numbers
+    # datagrams the kernel dropped on this UDP socket because its receive
+    # buffer was full (SO_RXQ_OVFL; Linux only, None = not available)
+    kernel_drops: Optional[int] = None
     packages: int = 0
     elapsed: float = 0.0
     by_mdid: Dict[int, int] = field(default_factory=dict)
@@ -821,6 +833,11 @@ class DataStats:
         self._last_seq[m.mdid] = m.seq
 
 
+def kdrops_field(stats: DataStats, sep: str = "") -> str:
+    """' kdrops=N<sep>' for one-line totals, or '' when the count is unavailable."""
+    return "" if stats.kernel_drops is None else f" kdrops={stats.kernel_drops}{sep}"
+
+
 def print_play_summary(stats: DataStats, title: str = "PLAY summary") -> None:
     """Print the final statistics of a completed (or interrupted) PLAY."""
     el = stats.elapsed or 0.0
@@ -847,8 +864,21 @@ def print_play_summary(stats: DataStats, title: str = "PLAY summary") -> None:
         cprint(f"  gaps by MDID  : {breakdown}", C.YELLOW)
     if stats.dupes:
         cprint(f"  duplicates/reorders : {stats.dupes}", C.YELLOW)
+    if stats.kernel_drops is not None:
+        hint = ("  (receive buffer overflow on this host; raise --rcvbuf "
+                "and net.core.rmem_max)" if stats.kernel_drops else "")
+        cprint(f"  kernel drops  : {stats.kernel_drops:,}{hint}",
+               C.YELLOW if stats.kernel_drops else C.RESET)
     cprint(f"  end-of-data   : {'yes' if stats.end_of_data else 'no'}",
            C.GREEN if stats.end_of_data else C.YELLOW)
+
+
+DEFAULT_RCVBUF = 64 * 1024 * 1024      # data-socket SO_RCVBUF request (bytes)
+
+# Linux socket options not always exported by the socket module
+_SO_RCVBUFFORCE = getattr(socket, "SO_RCVBUFFORCE", 33)
+_SO_RXQ_OVFL = getattr(socket, "SO_RXQ_OVFL", 40)
+_rcvbuf_warned = False                  # warn about a capped buffer only once
 
 
 class DataChannel:
@@ -862,7 +892,8 @@ class DataChannel:
     def __init__(self, lower: str, client_port: int, verbose: bool = False,
                  decode: bool = False, hexdump: bool = False,
                  decode_limit: int = 10, group: Optional[str] = None,
-                 interface: Optional[str] = None):
+                 interface: Optional[str] = None,
+                 rcvbuf: int = DEFAULT_RCVBUF):
         self.lower = lower.upper()
         self.client_port = client_port
         self.verbose = verbose
@@ -873,10 +904,45 @@ class DataChannel:
         self.group = group if is_multicast(group) else None
         self.interface = interface       # local IP for the multicast join/bind
         self._decoded_shown = 0
+        self.rcvbuf = rcvbuf             # requested SO_RCVBUF (0 = OS default)
+        self.rcvbuf_actual: Optional[int] = None   # what the kernel granted
         self.sock: Optional[socket.socket] = None
         self.conn: Optional[socket.socket] = None
+        # SO_RXQ_OVFL: the kernel stamps each datagram with the socket's
+        # cumulative drop count; None when unsupported on this platform
+        self._rxq_ovfl = False
+        self._rxq_drops = 0
+
+    def _size_rcvbuf(self, sock: socket.socket) -> None:
+        """Request a large receive buffer so bursts aren't dropped by the kernel.
+
+        SO_RCVBUF is silently capped at net.core.rmem_max; SO_RCVBUFFORCE
+        bypasses the cap but needs CAP_NET_ADMIN, so try it first.
+        """
+        global _rcvbuf_warned
+        if self.rcvbuf > 0:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, _SO_RCVBUFFORCE, self.rcvbuf)
+            except OSError:
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.rcvbuf)
+                except OSError as e:
+                    cprint(f"! could not set SO_RCVBUF: {e}", C.YELLOW)
+        got = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        if sys.platform.startswith("linux"):
+            got //= 2                    # Linux reports double (bookkeeping)
+        self.rcvbuf_actual = got
+        if self.rcvbuf > 0 and got < self.rcvbuf and not _rcvbuf_warned:
+            _rcvbuf_warned = True
+            cprint(f"! data socket receive buffer is {human_bytes(got)}, "
+                   f"requested {human_bytes(self.rcvbuf)} (capped by "
+                   f"net.core.rmem_max); to allow it: sudo sysctl -w "
+                   f"net.core.rmem_max={self.rcvbuf}", C.YELLOW)
+        elif self.verbose:
+            cprint(f"* Data channel: receive buffer {human_bytes(got)}", C.DIM)
 
     def open(self) -> None:
+        self._rxq_drops = 0
         if self.lower == "UDP":
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -884,6 +950,14 @@ class DataChannel:
                 self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except (AttributeError, OSError):
                 pass
+            self._size_rcvbuf(self.sock)
+            self._rxq_ovfl = False
+            if sys.platform.startswith("linux") and hasattr(self.sock, "recvmsg"):
+                try:
+                    self.sock.setsockopt(socket.SOL_SOCKET, _SO_RXQ_OVFL, 1)
+                    self._rxq_ovfl = True
+                except OSError:
+                    pass
             self.sock.bind(("", self.client_port))
             if self.group:
                 self._join_multicast()
@@ -897,6 +971,7 @@ class DataChannel:
         else:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._size_rcvbuf(self.sock)     # inherited by the accepted socket
             self.sock.bind(("0.0.0.0", self.client_port))
             self.sock.listen(1)
             if self.verbose:
@@ -949,6 +1024,10 @@ class DataChannel:
         """
         if stats is None:
             stats = DataStats()
+        if self.lower == "UDP" and self._rxq_ovfl:
+            # the counter is cumulative per socket; report drops since now
+            drops_base = self._rxq_drops
+            stats.kernel_drops = 0
         start = time.time()
         hard_deadline = start + duration if duration and duration > 0 else None
         sel = selectors.DefaultSelector()
@@ -973,7 +1052,17 @@ class DataChannel:
                 for key, _ in sel.select(timeout=timeout):
                     tag = key.data
                     if tag == "udp":
-                        data, _addr = self.sock.recvfrom(65536)
+                        if self._rxq_ovfl:
+                            data, anc, _fl, _addr = self.sock.recvmsg(
+                                65536, socket.CMSG_SPACE(4))
+                            for level, ctype, cdata in anc:
+                                if (level == socket.SOL_SOCKET
+                                        and ctype == _SO_RXQ_OVFL
+                                        and len(cdata) >= 4):
+                                    self._rxq_drops = struct.unpack("=I", cdata[:4])[0]
+                                    stats.kernel_drops = self._rxq_drops - drops_base
+                        else:
+                            data, _addr = self.sock.recvfrom(65536)
                         self._consume_datagram(data, stats)
                     elif tag == "listen":
                         self.conn, addr = self.sock.accept()
@@ -1033,7 +1122,7 @@ class DataChannel:
                f"({inst_rate:,.0f}/s) data={human_bytes(stats.bytes)} "
                f"({human_bytes(inst_bw)}/s) pkgs={stats.packages:,} "
                f"mdids={len(stats.by_mdid)} gaps={stats.gaps} "
-               f"lost={stats.lost}{eod}", C.BLUE)
+               f"lost={stats.lost}{kdrops_field(stats)}{eod}", C.BLUE)
 
     def _consume_datagram(self, data: bytes, stats: DataStats) -> None:
         dm = decode_datamsg(data)
@@ -1103,7 +1192,7 @@ class ConformanceTester:
                  prange: Optional[str], decode: bool = False,
                  hexdump: bool = False, check_timeout: bool = False,
                  stats_interval: float = 0.0, keepalive_arg=None,
-                 keepalive_method: str = "auto"):
+                 keepalive_method: str = "auto", rcvbuf: int = DEFAULT_RCVBUF):
         self.c = client
         self.uri = uri
         self.transport = transport
@@ -1117,6 +1206,7 @@ class ConformanceTester:
         self.stats_interval = stats_interval
         self.keepalive_arg = keepalive_arg
         self.keepalive_method = keepalive_method
+        self.rcvbuf = rcvbuf
         self.results: List[TestResult] = []
 
     def _reconnect(self) -> None:
@@ -1127,7 +1217,8 @@ class ConformanceTester:
 
     def _mkchannel(self) -> "DataChannel":
         return DataChannel(self.data_lower, self.client_port, verbose=self.c.verbose,
-                           decode=self.decode, hexdump=self.hexdump)
+                           decode=self.decode, hexdump=self.hexdump,
+                           rcvbuf=self.rcvbuf)
 
     def _expect(self, name, action, ok_codes, allow_drop=True) -> None:
         """Run action() (fresh connection) and assert its status is in ok_codes.
@@ -1360,6 +1451,11 @@ def add_transport_args(p: argparse.ArgumentParser) -> None:
                    "the Transport destination")
     p.add_argument("--interface", help="local interface IP for the multicast "
                    "join / data socket (default: any)")
+    p.add_argument("--rcvbuf", type=parse_size, default=DEFAULT_RCVBUF,
+                   metavar="SIZE",
+                   help="data-socket receive buffer (SO_RCVBUF), bytes or with a "
+                        "K/M/G suffix (default 64M; 0 = OS default). Linux caps "
+                        "it at net.core.rmem_max unless run with CAP_NET_ADMIN")
 
 
 def add_decode_args(p: argparse.ArgumentParser) -> None:
@@ -1478,7 +1574,8 @@ def make_data_channel(args, verbose: Optional[bool] = None) -> "DataChannel":
                        decode=args.decode, hexdump=args.hexdump,
                        decode_limit=args.decode_limit,
                        group=initial_group(args),
-                       interface=getattr(args, "interface", None))
+                       interface=getattr(args, "interface", None),
+                       rcvbuf=getattr(args, "rcvbuf", DEFAULT_RCVBUF))
 
 
 def apply_server_transport(data: "DataChannel", client: "RTSPClient",
@@ -1516,7 +1613,7 @@ def cmd_test(args) -> int:
             decode=args.decode, hexdump=args.hexdump,
             check_timeout=args.check_timeout,
             stats_interval=args.stats_interval, keepalive_arg=args.keepalive,
-            keepalive_method=args.keepalive_method,
+            keepalive_method=args.keepalive_method, rcvbuf=args.rcvbuf,
         )
         ok = tester.run()
     return 0 if ok else 1
@@ -1944,6 +2041,8 @@ def cmd_interactive(args) -> int:
             dc = f"{data.lower} :{data.client_port}"
             if data.group:
                 dc += f" group={data.group}"
+            if data.rcvbuf_actual is not None:
+                dc += f"  rcvbuf={human_bytes(data.rcvbuf_actual)}"
             dc += f"  open={'yes' if data.sock is not None else 'no'}"
             recv = ("paused" if sess["rtsp"] == "PAUSED"
                     else "background" if bg_active() else "no")
@@ -1953,8 +2052,8 @@ def cmd_interactive(args) -> int:
         s = bg["stats"]
         if s is not None:
             cprint(f"  received   : {s.messages:,} msgs, {human_bytes(s.bytes)}, "
-                   f"{s.packages:,} pkgs, gaps={s.gaps}, lost={s.lost}, "
-                   f"eod={s.end_of_data}", C.DIM)
+                   f"{s.packages:,} pkgs, gaps={s.gaps}, lost={s.lost},"
+                   f"{kdrops_field(s, ',')} eod={s.end_of_data}", C.DIM)
         cprint(f"  CSeq       : {c.cseq}", C.DIM)
 
     def show_context():
@@ -2108,7 +2207,8 @@ def cmd_interactive(args) -> int:
                 s = bg["stats"]
                 cprint(f"* {s.messages:,} msgs, {human_bytes(s.bytes)}, "
                        f"{s.packages:,} pkgs, mdids={compact_ranges(s.by_mdid)}, "
-                       f"gaps={s.gaps}, lost={s.lost}, eod={s.end_of_data}", C.BOLD)
+                       f"gaps={s.gaps}, lost={s.lost},{kdrops_field(s, ',')} "
+                       f"eod={s.end_of_data}", C.BOLD)
             else:
                 cprint("* not receiving (use 'play')", C.YELLOW)
         elif cmd == "stop":

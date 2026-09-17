@@ -132,6 +132,7 @@ At the end of the PLAY it prints a **summary** of the data received:
   sequence gaps : 3  (est. 12 message(s) lost)
   gaps by MDID  : 7=3 gap(s)/12 lost
   duplicates/reorders : 0
+  kernel drops  : 0
   end-of-data   : yes
 ```
 
@@ -140,6 +141,27 @@ detected per-MDID (`MessageDefinitionSequenceNumber`, Ch.26 §26.5.1); the
 **estimated lost-message count** is the sum of the sequence-number deltas
 across gaps, with a per-MDID breakdown. Duplicate or out-of-order sequence
 numbers are counted separately as `duplicates/reorders` (not as loss).
+
+**Kernel drops (UDP, Linux).** `kernel drops` (`kdrops=` on one-line totals)
+counts datagrams the kernel discarded on the data socket because its receive
+buffer was full, i.e. the client could not read fast enough, via the
+per-socket `SO_RXQ_OVFL` counter. When `kernel drops` roughly equals the
+estimated `lost`, the loss happened on this host, not on the network. Drops
+after the last datagram received (e.g. a dropped End-of-Data) can't be
+reported, because the count arrives with the next datagram.
+
+**Receive buffer (`--rcvbuf SIZE`).** The data socket requests a 64 MiB
+`SO_RCVBUF` by default (`--rcvbuf 64M`; bytes or a `K`/`M`/`G` suffix; `0`
+keeps the OS default) so high-rate bursts don't overflow. Linux silently caps
+the request at `net.core.rmem_max` (often ~208 KiB). The client warns when
+this happens, and you can raise the cap with:
+
+```bash
+sudo sysctl -w net.core.rmem_max=67108864
+```
+
+(Running with `CAP_NET_ADMIN` bypasses the cap via `SO_RCVBUFFORCE`.) The
+granted size is shown as `rcvbuf=` in the interactive `status` command.
 
 ### Long / continuous playback
 
@@ -315,7 +337,8 @@ Either pass a complete `--uri`, or let the tool build a
 ### Transport / data-channel options
 
 `--lower UDP|TCP`, `--cast unicast|multicast`, `--destination`, `--ttl`,
-`--client-port`, `--client-port-hi`, `--group <mcast>`, `--interface <ip>`.
+`--client-port`, `--client-port-hi`, `--group <mcast>`, `--interface <ip>`,
+`--rcvbuf <size>`.
 
 For **UDP** the client binds `client_port` locally and receives datagrams.
 For **TCP** the client **listens** on `client_port` and the source connects to
