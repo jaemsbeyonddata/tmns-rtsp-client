@@ -123,6 +123,48 @@ def close_logfile() -> Optional[str]:
         except OSError:
             pass
         return path
+
+
+# ----- optional sequence-gap log ------------------------------------------
+# One CSV row per sequence gap detected by DataStats, so gaps can be located
+# in time and compared across runs (e.g. two replays of the same range).
+_gap_fh = None
+_gap_lock = threading.Lock()
+GAP_LOG_HEADER = "recv_time,mdid,prev_seq,next_seq,missing,msg_timestamp\n"
+
+
+def open_gaplog(path: str) -> None:
+    """Create (truncate) the gap log and write its CSV header."""
+    global _gap_fh
+    fh = open(path, "w", encoding="utf-8", buffering=1)   # line-buffered
+    fh.write(GAP_LOG_HEADER)
+    with _gap_lock:
+        _gap_fh = fh
+
+
+def close_gaplog() -> None:
+    global _gap_fh
+    with _gap_lock:
+        fh, _gap_fh = _gap_fh, None
+    if fh is not None:
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+
+def _gaplog_write(mdid: int, prev: int, seq: int, missing: int, ts: int) -> None:
+    import datetime as _dt
+    # MessageTimestamp: upper 32 bits seconds, lower 32 nanoseconds (24.2.1.9)
+    line = (f"{_dt.datetime.now().isoformat(timespec='microseconds')},"
+            f"{mdid},{prev},{seq},{missing},"
+            f"{ts >> 32}.{ts & 0xFFFFFFFF:09d}\n")
+    with _gap_lock:
+        if _gap_fh is not None:
+            try:
+                _gap_fh.write(line)
+            except OSError:
+                pass
     return None
 
 
@@ -619,7 +661,7 @@ FLAG_STANDARD_PKG_HEADER = 0x0080
 STANDARD_PKG_HEADER_LEN = 12  # Ch.24 24.2.2.1.1
 
 # precompiled views for the no-decode fast path (DataStats.note_raw)
-_MSG_HDR = struct.Struct(">IIII")      # word0, MDID, sequence, MessageLength
+_MSG_HDR = struct.Struct(">IIIIQ")     # word0, MDID, seq, MessageLength, timestamp
 _PKG_HDR = struct.Struct(">IH")        # PackageDefinitionID, PackageLength
 
 # ApplicationDefinedFields option-kind names (Ch.24 Table 24-1, 106-24)
@@ -816,7 +858,7 @@ class DataStats:
         self.packages += len(dm.packages)
         for pkg in dm.packages:
             self.by_pdid[pkg.pdid] = self.by_pdid.get(pkg.pdid, 0) + 1
-        self._note_seq(m.mdid, m.seq, m.end_of_data)
+        self._note_seq(m.mdid, m.seq, m.end_of_data, m.timestamp)
 
     def note_raw(self, buf: bytes, off: int = 0, end: Optional[int] = None) -> bool:
         """Account the message at buf[off:end] without decoding it.
@@ -826,7 +868,7 @@ class DataStats:
         so a quiet receiver keeps up with high message rates.  The caller
         guarantees at least DATAMSG_HEADER_LEN bytes.  Returns End-of-Data.
         """
-        word0, mdid, seq, length = _MSG_HDR.unpack_from(buf, off)
+        word0, mdid, seq, length, ts = _MSG_HDR.unpack_from(buf, off)
         flags = word0 & 0xFFFF
         eod = bool(flags & FLAG_END_OF_DATA)
         self.messages += 1
@@ -845,10 +887,10 @@ class DataStats:
                 n += 1
                 p = (p + plen + 3) & ~3          # pad to next 32-bit boundary
             self.packages += n
-        self._note_seq(mdid, seq, eod)
+        self._note_seq(mdid, seq, eod, ts)
         return eod
 
-    def _note_seq(self, mdid: int, seq: int, end_of_data: bool) -> None:
+    def _note_seq(self, mdid: int, seq: int, end_of_data: bool, ts: int) -> None:
         # The empty End-of-Data indicator carries mdid=0/seq=0 and is not part
         # of any data sequence, so it never counts toward gap detection.
         if end_of_data:
@@ -867,6 +909,8 @@ class DataStats:
                 self.lost += missing
                 self.by_mdid_gaps[mdid] = self.by_mdid_gaps.get(mdid, 0) + 1
                 self.by_mdid_lost[mdid] = self.by_mdid_lost.get(mdid, 0) + missing
+                if _gap_fh is not None:
+                    _gaplog_write(mdid, prev, seq, missing, ts)
         self._last_seq[mdid] = seq
 
 
@@ -1548,6 +1592,9 @@ def add_receive_args(p: argparse.ArgumentParser) -> None:
                    help="keep-alive request method (default auto: GET_PARAMETER, "
                         "falling back to OPTIONS if the server returns 501/405). "
                         "Use 'options' for servers without GET_PARAMETER.")
+    p.add_argument("--gap-log", metavar="FILE",
+                   help="write one CSV row per sequence gap (recv_time, mdid, "
+                        "prev_seq, next_seq, missing, msg_timestamp) to FILE")
 
 
 def _send_keepalive(client: "RTSPClient", uri: str, method: str) -> RTSPResponse:
@@ -2447,6 +2494,13 @@ def main(argv=None) -> int:
             cprint(f"* logging to {p}", C.DIM)
         except OSError as e:
             cprint(f"! could not open log file: {e}", C.RED)
+    if getattr(args, "gap_log", None):
+        try:
+            open_gaplog(args.gap_log)
+            cprint(f"* logging sequence gaps to {args.gap_log}", C.DIM)
+        except OSError as e:
+            cprint(f"! could not open gap log: {e}", C.RED)
+            return 2
     try:
         return args.func(args)
     except KeyboardInterrupt:
@@ -2456,6 +2510,7 @@ def main(argv=None) -> int:
         cprint(f"! error: {e}", C.RED)
         return 2
     finally:
+        close_gaplog()
         close_logfile()
 
 

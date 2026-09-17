@@ -142,6 +142,22 @@ detected per-MDID (`MessageDefinitionSequenceNumber`, Ch.26 §26.5.1); the
 across gaps, with a per-MDID breakdown. Duplicate or out-of-order sequence
 numbers are counted separately as `duplicates/reorders` (not as loss).
 
+**Gap log (`--gap-log FILE`).** Writes one CSV row per sequence gap, so you can
+see where each gap happened and compare runs. For example, replay the same
+closed range twice: identical rows mean the gaps are in the recorded data, not
+caused by delivery.
+
+```
+recv_time,mdid,prev_seq,next_seq,missing,msg_timestamp
+2026-09-16T20:49:13.914594,1,9,13,3,1789572854.000000000
+2026-09-16T20:49:13.914937,1,42,50,7,1789572857.000000000
+```
+
+`recv_time` is the local receive time, and `msg_timestamp` is the
+`MessageTimestamp` (seconds.nanoseconds) of the message *after* the gap. The
+file is overwritten at startup and line-buffered, so `tail -f` works during a
+long playback. Available on `stream`, `test`, `method` and `interactive`.
+
 **Kernel drops (UDP, Linux).** `kernel drops` (`kdrops=` on one-line totals)
 counts datagrams the kernel discarded on the data socket because its receive
 buffer was full, i.e. the client could not read fast enough, via the
