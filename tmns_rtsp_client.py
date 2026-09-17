@@ -989,6 +989,7 @@ class DataChannel:
         self.rcvbuf_actual: Optional[int] = None   # what the kernel granted
         self.sock: Optional[socket.socket] = None
         self.conn: Optional[socket.socket] = None
+        self._streambuf = b""            # unparsed TCP bytes (partial message)
         # SO_RXQ_OVFL: the kernel stamps each datagram with the socket's
         # cumulative drop count; None when unsupported on this platform
         self._rxq_ovfl = False
@@ -1116,9 +1117,12 @@ class DataChannel:
         if self.lower == "UDP":
             self.sock.setblocking(False)     # drained in batches per wake-up
             sel.register(self.sock, selectors.EVENT_READ, data="udp")
+        elif self.conn is not None:
+            # TCP: the data connection outlives a stop/pause and is reused by
+            # the next PLAY; it is only closed by TEARDOWN (close())
+            sel.register(self.conn, selectors.EVENT_READ, data="tcp")
         else:  # TCP: wait for the source to connect, then read the stream
             sel.register(self.sock, selectors.EVENT_READ, data="listen")
-        streambuf = b""
         last_stats = start
         last_ka = start
         prev = (start, 0, 0)   # (t, messages, bytes) snapshot for interval rate
@@ -1139,17 +1143,28 @@ class DataChannel:
                     elif tag == "listen":
                         self.conn, addr = self.sock.accept()
                         self.conn.setblocking(False)
+                        self._streambuf = b""
                         sel.unregister(self.sock)
                         sel.register(self.conn, selectors.EVENT_READ, data="tcp")
                         if self.verbose:
                             cprint(f"* Data source connected from {addr}", C.DIM)
                     elif tag == "tcp":
-                        chunk = self.conn.recv(65536)
+                        try:
+                            chunk = self.conn.recv(65536)
+                        except (BlockingIOError, InterruptedError):
+                            continue
+                        except OSError:
+                            chunk = b""          # reset by the source
                         if not chunk:
+                            # source closed the connection: a later PLAY waits
+                            # for it to connect again
+                            self._drop_conn()
                             stats.end_of_data = True
                             break
-                        streambuf += chunk
-                        streambuf = self._consume_stream(streambuf, stats)
+                        # bytes of an incomplete message are kept across
+                        # receive() calls so the stream stays aligned
+                        self._streambuf = self._consume_stream(
+                            self._streambuf + chunk, stats)
 
                 now = time.time()
                 if stats_interval > 0 and now - last_stats >= stats_interval:
@@ -1276,14 +1291,23 @@ class DataChannel:
             cprint(f"    data: mdid={m.mdid} seq={m.seq} len={m.length} "
                    f"flags=0x{m.flags:04x} ({pb}){tag}", C.MAGENTA)
 
+    def _drop_conn(self) -> None:
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except OSError:
+                pass
+        self.conn = None
+        self._streambuf = b""
+
     def close(self) -> None:
-        for s in (self.conn, self.sock):
-            if s:
-                try:
-                    s.close()
-                except OSError:
-                    pass
-        self.conn = self.sock = None
+        self._drop_conn()
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
 
 
 # ----- Conformance test suite --------------------------------------------

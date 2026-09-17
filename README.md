@@ -291,6 +291,15 @@ tmns-rtsp> teardown
 per-message output) — handy for a quick look. Background streaming is quiet by
 design; use `stats` for totals on demand.
 
+**A TCP data connection lasts until `teardown`.** Once the source connects,
+`stop`, `pause` and `play` keep reading from the same connection, and any bytes
+of a partly received message are kept so the stream stays aligned. The client
+waits for a new connection only after `teardown` (or if the source closes it).
+A quiet connection is never timed out, so a PLAY whose `ptp-clock` range starts
+in the future can sit idle until the source starts sending. While stopped,
+nothing reads the connection, so the source is held back by TCP flow control
+until you `play` again.
+
 **The session is kept alive from `setup` until `teardown`.** A background
 keep-alive thread starts at SETUP and runs continuously — through PLAY, PAUSE,
 End-of-Data, and while idle at the prompt — so the server never times the
