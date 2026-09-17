@@ -163,6 +163,14 @@ sudo sysctl -w net.core.rmem_max=67108864
 (Running with `CAP_NET_ADMIN` bypasses the cap via `SO_RCVBUFFORCE`.) The
 granted size is shown as `rcvbuf=` in the interactive `status` command.
 
+**Quiet receive fast path.** Unless `--decode`/`--hexdump`/`-v` is on (and
+always for interactive background streaming), the receiver doesn't decode
+messages. It reads the message header and PackageHeaders in place and updates
+the same totals (messages, bytes, packages, MDIDs/PDIDs, gaps). It also reads
+every queued UDP datagram per wake-up instead of one per `select()`. This
+keeps a Python client up with high message rates; per-message decoding
+switches back on only when it's needed for output.
+
 ### Long / continuous playback
 
 For large datasets that take a long time to transfer (e.g. a bounded

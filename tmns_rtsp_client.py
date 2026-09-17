@@ -618,6 +618,10 @@ FLAG_STANDARD_PKG_HEADER = 0x0080
 
 STANDARD_PKG_HEADER_LEN = 12  # Ch.24 24.2.2.1.1
 
+# precompiled views for the no-decode fast path (DataStats.note_raw)
+_MSG_HDR = struct.Struct(">IIII")      # word0, MDID, sequence, MessageLength
+_PKG_HDR = struct.Struct(">IH")        # PackageDefinitionID, PackageLength
+
 # ApplicationDefinedFields option-kind names (Ch.24 Table 24-1, 106-24)
 OPTION_KINDS = {
     0x00: "End-of-Options", 0x01: "NOP",
@@ -812,14 +816,47 @@ class DataStats:
         self.packages += len(dm.packages)
         for pkg in dm.packages:
             self.by_pdid[pkg.pdid] = self.by_pdid.get(pkg.pdid, 0) + 1
+        self._note_seq(m.mdid, m.seq, m.end_of_data)
+
+    def note_raw(self, buf: bytes, off: int = 0, end: Optional[int] = None) -> bool:
+        """Account the message at buf[off:end] without decoding it.
+
+        Same totals as note(decode_datamsg(...)), but reads the header and
+        PackageHeaders in place, without building objects or copying payloads,
+        so a quiet receiver keeps up with high message rates.  The caller
+        guarantees at least DATAMSG_HEADER_LEN bytes.  Returns End-of-Data.
+        """
+        word0, mdid, seq, length = _MSG_HDR.unpack_from(buf, off)
+        flags = word0 & 0xFFFF
+        eod = bool(flags & FLAG_END_OF_DATA)
+        self.messages += 1
+        self.bytes += length
+        self.by_mdid[mdid] = self.by_mdid.get(mdid, 0) + 1
+        if flags & FLAG_STANDARD_PKG_HEADER and not eod:
+            p = off + DATAMSG_HEADER_LEN + ((word0 >> 24) & 0xF) * 4
+            stop = min(len(buf) if end is None else end, off + length)
+            by_pdid = self.by_pdid
+            n = 0
+            while p + STANDARD_PKG_HEADER_LEN <= stop:
+                pdid, plen = _PKG_HDR.unpack_from(buf, p)
+                if plen < STANDARD_PKG_HEADER_LEN:
+                    break
+                by_pdid[pdid] = by_pdid.get(pdid, 0) + 1
+                n += 1
+                p = (p + plen + 3) & ~3          # pad to next 32-bit boundary
+            self.packages += n
+        self._note_seq(mdid, seq, eod)
+        return eod
+
+    def _note_seq(self, mdid: int, seq: int, end_of_data: bool) -> None:
         # The empty End-of-Data indicator carries mdid=0/seq=0 and is not part
         # of any data sequence, so it never counts toward gap detection.
-        if m.end_of_data:
+        if end_of_data:
             self.end_of_data = True
             return
-        prev = self._last_seq.get(m.mdid)
+        prev = self._last_seq.get(mdid)
         if prev is not None:
-            diff = (m.seq - prev) & 0xFFFFFFFF     # forward distance (wrap-safe)
+            diff = (seq - prev) & 0xFFFFFFFF       # forward distance (wrap-safe)
             if diff == 0 or diff > 0x7FFFFFFF:
                 # same seq (duplicate) or a backward jump (reordering)
                 self.dupes += 1
@@ -828,9 +865,9 @@ class DataStats:
                 missing = diff - 1
                 self.gaps += 1
                 self.lost += missing
-                self.by_mdid_gaps[m.mdid] = self.by_mdid_gaps.get(m.mdid, 0) + 1
-                self.by_mdid_lost[m.mdid] = self.by_mdid_lost.get(m.mdid, 0) + missing
-        self._last_seq[m.mdid] = m.seq
+                self.by_mdid_gaps[mdid] = self.by_mdid_gaps.get(mdid, 0) + 1
+                self.by_mdid_lost[mdid] = self.by_mdid_lost.get(mdid, 0) + missing
+        self._last_seq[mdid] = seq
 
 
 def kdrops_field(stats: DataStats, sep: str = "") -> str:
@@ -912,6 +949,7 @@ class DataChannel:
         # cumulative drop count; None when unsupported on this platform
         self._rxq_ovfl = False
         self._rxq_drops = 0
+        self._drops_base = 0
 
     def _size_rcvbuf(self, sock: socket.socket) -> None:
         """Request a large receive buffer so bursts aren't dropped by the kernel.
@@ -1026,12 +1064,13 @@ class DataChannel:
             stats = DataStats()
         if self.lower == "UDP" and self._rxq_ovfl:
             # the counter is cumulative per socket; report drops since now
-            drops_base = self._rxq_drops
+            self._drops_base = self._rxq_drops
             stats.kernel_drops = 0
         start = time.time()
         hard_deadline = start + duration if duration and duration > 0 else None
         sel = selectors.DefaultSelector()
         if self.lower == "UDP":
+            self.sock.setblocking(False)     # drained in batches per wake-up
             sel.register(self.sock, selectors.EVENT_READ, data="udp")
         else:  # TCP: wait for the source to connect, then read the stream
             sel.register(self.sock, selectors.EVENT_READ, data="listen")
@@ -1052,18 +1091,7 @@ class DataChannel:
                 for key, _ in sel.select(timeout=timeout):
                     tag = key.data
                     if tag == "udp":
-                        if self._rxq_ovfl:
-                            data, anc, _fl, _addr = self.sock.recvmsg(
-                                65536, socket.CMSG_SPACE(4))
-                            for level, ctype, cdata in anc:
-                                if (level == socket.SOL_SOCKET
-                                        and ctype == _SO_RXQ_OVFL
-                                        and len(cdata) >= 4):
-                                    self._rxq_drops = struct.unpack("=I", cdata[:4])[0]
-                                    stats.kernel_drops = self._rxq_drops - drops_base
-                        else:
-                            data, _addr = self.sock.recvfrom(65536)
-                        self._consume_datagram(data, stats)
+                        self._drain_udp(stats)
                     elif tag == "listen":
                         self.conn, addr = self.sock.accept()
                         self.conn.setblocking(False)
@@ -1124,7 +1152,38 @@ class DataChannel:
                f"mdids={len(stats.by_mdid)} gaps={stats.gaps} "
                f"lost={stats.lost}{kdrops_field(stats)}{eod}", C.BLUE)
 
+    UDP_BATCH = 1024    # datagrams read per wake-up before re-checking deadlines
+
+    def _drain_udp(self, stats: DataStats) -> None:
+        """Read every queued datagram (up to UDP_BATCH) without re-selecting."""
+        sock = self.sock
+        ovfl = self._rxq_ovfl
+        cmsg_size = socket.CMSG_SPACE(4)
+        for _ in range(self.UDP_BATCH):
+            try:
+                if ovfl:
+                    data, anc, _fl, _addr = sock.recvmsg(65536, cmsg_size)
+                    # present only once the socket has dropped something
+                    for level, ctype, cdata in anc:
+                        if (level == socket.SOL_SOCKET and ctype == _SO_RXQ_OVFL
+                                and len(cdata) >= 4):
+                            self._rxq_drops = struct.unpack("=I", cdata[:4])[0]
+                            stats.kernel_drops = self._rxq_drops - self._drops_base
+                else:
+                    data = sock.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                return
+            except ConnectionRefusedError:      # stray ICMP port-unreachable
+                continue
+            self._consume_datagram(data, stats)
+            if stats.end_of_data:
+                return
+
     def _consume_datagram(self, data: bytes, stats: DataStats) -> None:
+        if not (self.decode or self.verbose):
+            if len(data) >= DATAMSG_HEADER_LEN:
+                stats.note_raw(data)
+            return
         dm = decode_datamsg(data)
         if dm is None:
             if self.verbose:
@@ -1134,21 +1193,29 @@ class DataChannel:
         self._report(dm)
 
     def _consume_stream(self, buf: bytes, stats: DataStats) -> bytes:
-        while len(buf) >= DATAMSG_HEADER_LEN:
-            h = parse_datamsg_header(buf)
-            if h.length < DATAMSG_HEADER_LEN:
+        # walk by offset and slice the remainder once, instead of re-copying
+        # the buffer after every message
+        fast = not (self.decode or self.verbose)
+        off, n = 0, len(buf)
+        while n - off >= DATAMSG_HEADER_LEN:
+            length = _MSG_HDR.unpack_from(buf, off)[3]
+            if length < DATAMSG_HEADER_LEN:
                 # bad length; resync by dropping a byte
-                buf = buf[1:]
+                off += 1
                 continue
-            if len(buf) < h.length:
+            if n - off < length:
                 break
-            dm = decode_datamsg(buf[:h.length])
-            stats.note(dm)
-            self._report(dm)
-            buf = buf[h.length:]
-            if h.end_of_data:
+            if fast:
+                eod = stats.note_raw(buf, off, off + length)
+            else:
+                dm = decode_datamsg(buf[off:off + length])
+                stats.note(dm)
+                self._report(dm)
+                eod = dm.header.end_of_data
+            off += length
+            if eod:
                 break
-        return buf
+        return buf[off:]
 
     def _report(self, dm: DecodedMessage) -> None:
         if self.decode:
