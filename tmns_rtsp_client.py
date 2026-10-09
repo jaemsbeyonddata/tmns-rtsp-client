@@ -834,6 +834,8 @@ class DataStats:
     messages: int = 0
     bytes: int = 0
     end_of_data: bool = False
+    # the source closed the TCP data connection without sending End-of-Data
+    peer_closed: bool = False
     gaps: int = 0
     lost: int = 0                    # estimated missing messages (from seq deltas)
     dupes: int = 0                   # duplicate/reordered sequence numbers
@@ -950,8 +952,13 @@ def print_play_summary(stats: DataStats, title: str = "PLAY summary") -> None:
                 "and net.core.rmem_max)" if stats.kernel_drops else "")
         cprint(f"  kernel drops  : {stats.kernel_drops:,}{hint}",
                C.YELLOW if stats.kernel_drops else C.RESET)
-    cprint(f"  end-of-data   : {'yes' if stats.end_of_data else 'no'}",
-           C.GREEN if stats.end_of_data else C.YELLOW)
+    if stats.end_of_data:
+        cprint("  end-of-data   : yes", C.GREEN)
+    elif stats.peer_closed:
+        cprint("  end-of-data   : no -- data connection closed by the source",
+               C.RED)
+    else:
+        cprint("  end-of-data   : no", C.YELLOW)
 
 
 DEFAULT_RCVBUF = 64 * 1024 * 1024      # data-socket SO_RCVBUF request (bytes)
@@ -1094,7 +1101,8 @@ class DataChannel:
         """Receive TmNSDataMessages until a deadline or End-of-Data.
 
         duration           max seconds to receive; None/0 = until End-of-Data
-                           (or the peer closes a TCP data channel, or Ctrl-C).
+                           (or the peer closes a TCP data channel, which sets
+                           stats.peer_closed, or Ctrl-C).
         stats_interval     if > 0, print a running statistics line every N sec.
         keepalive          optional zero-arg callable invoked every
                            keepalive_interval seconds (e.g. an RTSP
@@ -1127,7 +1135,7 @@ class DataChannel:
         last_ka = start
         prev = (start, 0, 0)   # (t, messages, bytes) snapshot for interval rate
         try:
-            while not stats.end_of_data:
+            while not (stats.end_of_data or stats.peer_closed):
                 now = time.time()
                 if hard_deadline and now >= hard_deadline:
                     break
@@ -1156,10 +1164,11 @@ class DataChannel:
                         except OSError:
                             chunk = b""          # reset by the source
                         if not chunk:
-                            # source closed the connection: a later PLAY waits
-                            # for it to connect again
+                            # source closed the connection (a drop, not
+                            # End-of-Data): a later PLAY waits for it to
+                            # connect again
                             self._drop_conn()
-                            stats.end_of_data = True
+                            stats.peer_closed = True
                             break
                         # bytes of an incomplete message are kept across
                         # receive() calls so the stream stays aligned
@@ -1204,7 +1213,8 @@ class DataChannel:
         dt = now - prev[0]
         inst_rate = (stats.messages - prev[1]) / dt if dt > 0 else 0.0
         inst_bw = (stats.bytes - prev[2]) / dt if dt > 0 else 0.0
-        eod = " EOD" if stats.end_of_data else ""
+        eod = (" EOD" if stats.end_of_data
+               else " CLOSED" if stats.peer_closed else "")
         cprint(f"  [{fmt_hms(elapsed)}] msgs={stats.messages:,} "
                f"({inst_rate:,.0f}/s) data={human_bytes(stats.bytes)} "
                f"({human_bytes(inst_bw)}/s) pkgs={stats.packages:,} "
@@ -2191,7 +2201,8 @@ def cmd_interactive(args) -> int:
         if s is not None:
             cprint(f"  received   : {s.messages:,} msgs, {human_bytes(s.bytes)}, "
                    f"{s.packages:,} pkgs, gaps={s.gaps}, lost={s.lost},"
-                   f"{kdrops_field(s, ',')} eod={s.end_of_data}", C.DIM)
+                   f"{kdrops_field(s, ',')} eod={s.end_of_data}"
+                   + (" (peer closed)" if s.peer_closed else ""), C.DIM)
         cprint(f"  CSeq       : {c.cseq}", C.DIM)
 
     def show_context():
@@ -2229,9 +2240,14 @@ def cmd_interactive(args) -> int:
     def handle(cmd, parts):
         """Execute one command. Returns 'quit' to exit, else None."""
         nonlocal data, uri
-        # finalize a background stream that ended on its own (End-of-Data)
+        # finalize a background stream that ended on its own (End-of-Data,
+        # or the source dropping the TCP data connection)
         if bg["thread"] is not None and not bg["thread"].is_alive():
-            cprint("* background receive ended (End-of-Data).", C.DIM)
+            if bg["stats"] is not None and bg["stats"].peer_closed:
+                cprint("! background receive ended: data connection closed "
+                       "by the source (no End-of-Data).", C.YELLOW)
+            else:
+                cprint("* background receive ended (End-of-Data).", C.DIM)
             stop_background(summary=True)
             sess["rtsp"] = "READY"
 
@@ -2346,7 +2362,8 @@ def cmd_interactive(args) -> int:
                 cprint(f"* {s.messages:,} msgs, {human_bytes(s.bytes)}, "
                        f"{s.packages:,} pkgs, mdids={compact_ranges(s.by_mdid)}, "
                        f"gaps={s.gaps}, lost={s.lost},{kdrops_field(s, ',')} "
-                       f"eod={s.end_of_data}", C.BOLD)
+                       f"eod={s.end_of_data}"
+                       + (" (peer closed)" if s.peer_closed else ""), C.BOLD)
             else:
                 cprint("* not receiving (use 'play')", C.YELLOW)
         elif cmd == "stop":
