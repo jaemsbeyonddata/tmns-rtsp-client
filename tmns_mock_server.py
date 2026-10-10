@@ -169,7 +169,7 @@ class MockSource:
     def __init__(self, port, mdid, pdid, rate, session_timeout,
                  ch10_path=None, mdid_upper=0, loop=False,
                  max_msg_bytes=DEFAULT_MAX_MSG_BYTES, no_get_parameter=False,
-                 gp_405=False):
+                 gp_405=False, max_sessions=0):
         self.port = port
         self.mdid = mdid
         self.pdid = pdid
@@ -181,7 +181,9 @@ class MockSource:
         self.ch10_path = ch10_path
         self.mdid_upper = mdid_upper
         self.loop = loop
+        self.max_sessions = max_sessions      # 0 = unlimited
         self.sessions = {}
+        self._lock = threading.Lock()         # session count + id allocation
         self._sid_counter = 0x1000
 
     def serve(self):
@@ -210,6 +212,7 @@ class MockSource:
         print(f"[mock] control connection from {addr}")
         buf = b""
         sess = None
+        used = set()                    # sessions set up/used on this connection
         try:
             while True:
                 while b"\r\n\r\n" not in buf:
@@ -233,11 +236,17 @@ class MockSource:
                     buf += chunk
                 buf = buf[clen:]
                 sess = self._dispatch(conn, method.upper(), uri, headers, addr, sess)
+                if sess is not None:
+                    used.add(sess.sid)
         except (ConnectionError, OSError):
             pass
         finally:
-            if sess:
-                sess.stop.set()
+            # the stream stops with its control connection, so its session
+            # (and any earlier one set up without a TEARDOWN) ends too
+            for sid in used:
+                s = self.sessions.pop(sid, None)
+                if s:
+                    s.stop.set()
             conn.close()
             print(f"[mock] control connection {addr} closed")
 
@@ -249,6 +258,15 @@ class MockSource:
         if body:
             lines.append(f"Content-Length: {len(body)}")
         conn.sendall(("\r\n".join(lines) + "\r\n\r\n").encode() + body)
+
+    def _expire_idle(self):
+        """Drop sessions idle past the timeout (caller holds self._lock)."""
+        now = time.time()
+        for sid, s in list(self.sessions.items()):
+            if now - s.last_activity > self.session_timeout:
+                s.stop.set()
+                self.sessions.pop(sid, None)
+                print(f"[mock] session {sid} expired")
 
     def _lookup_session(self, headers):
         """Return (session, error_code). Enforces existence and expiry."""
@@ -316,8 +334,27 @@ class MockSource:
             if "TMNS/TMNSP" not in transport.upper():
                 self._reply(conn, cseq, 461, "Unsupported Transport")
                 return sess
-            self._sid_counter += 1
-            sess = Session(f"{self._sid_counter:08X}")
+            if headers.get("session"):
+                # SETUP on an existing session changes its transport (RFC 2326
+                # 10.4); refused while its stream runs (playing or paused)
+                sess, err = self._lookup_session(headers)
+                if err:
+                    self._reply(conn, cseq, 454, "Session Not Found")
+                    return None
+                if sess.thread and sess.thread.is_alive():
+                    self._reply(conn, cseq, 455, "Method Not Valid in This State")
+                    return sess
+            else:
+                with self._lock:
+                    self._expire_idle()
+                    if self.max_sessions and len(self.sessions) >= self.max_sessions:
+                        print(f"[mock] SETUP refused: {len(self.sessions)} "
+                              f"session(s), --max-sessions {self.max_sessions}")
+                        self._reply(conn, cseq, 503, "Service Unavailable")
+                        return sess
+                    self._sid_counter += 1
+                    sess = Session(f"{self._sid_counter:08X}")
+                    self.sessions[sess.sid] = sess
             m = re.search(r"TMNS/TMNSP/(TCP|UDP)", transport, re.I)
             if m:
                 sess.lower = m.group(1).upper()
@@ -326,7 +363,6 @@ class MockSource:
                 sess.client_port = int(m.group(1))
             m = re.search(r"destination=([\d.]+)", transport)
             sess.dest = m.group(1) if m else addr[0]
-            self.sessions[sess.sid] = sess
             self._reply(conn, cseq, 200, "OK",
                         {"Session": f"{sess.sid};timeout={self.session_timeout}",
                          "Transport": transport.split(",")[0].strip()})
@@ -546,6 +582,9 @@ def main():
                     help="cap each TmNSDataMessage size; larger Chapter 11 bodies "
                          "are split across Packages/messages "
                          f"(default {DEFAULT_MAX_MSG_BYTES})")
+    ap.add_argument("--max-sessions", type=int, default=0,
+                    help="most RTSP sessions open at once; a SETUP beyond it gets "
+                         "503 Service Unavailable (default 0 = unlimited)")
     ap.add_argument("--no-get-parameter", action="store_true",
                     help="reject GET_PARAMETER with 501 (simulate a server that "
                          "lacks it, to test OPTIONS-based keep-alive)")
@@ -557,7 +596,8 @@ def main():
                args.session_timeout, ch10_path=args.ch10,
                mdid_upper=args.mdid_upper, loop=args.loop,
                max_msg_bytes=args.max_msg_bytes,
-               no_get_parameter=args.no_get_parameter, gp_405=args.gp_405).serve()
+               no_get_parameter=args.no_get_parameter, gp_405=args.gp_405,
+               max_sessions=args.max_sessions).serve()
 
 
 if __name__ == "__main__":

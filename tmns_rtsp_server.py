@@ -181,13 +181,16 @@ class TmnsRtspServer:
     KNOWN_METHODS = {"OPTIONS", "DESCRIBE", "SETUP", "PLAY", "PAUSE",
                      "TEARDOWN", "GET_PARAMETER"}
 
-    def __init__(self, library, port, session_timeout=60, speed=1.0, asap=False):
+    def __init__(self, library, port, session_timeout=60, speed=1.0, asap=False,
+                 max_sessions=0):
         self.lib = library
         self.port = port
         self.session_timeout = session_timeout
         self.speed = speed
         self.asap = asap
+        self.max_sessions = max_sessions      # 0 = unlimited
         self.sessions = {}
+        self._lock = threading.Lock()         # session count + id allocation
         self._sid = 0x2000
 
     def serve(self):
@@ -214,6 +217,7 @@ class TmnsRtspServer:
         print(f"[server] control connection from {addr}")
         buf = b""
         sess = None
+        used = set()                    # sessions set up/used on this connection
         try:
             while True:
                 while b"\r\n\r\n" not in buf:
@@ -237,11 +241,17 @@ class TmnsRtspServer:
                     buf += chunk
                 buf = buf[clen:]
                 sess = self._dispatch(conn, method.upper(), uri, headers, addr, sess)
+                if sess is not None:
+                    used.add(sess.sid)
         except (ConnectionError, OSError):
             pass
         finally:
-            if sess:
-                sess.stop.set()
+            # the stream stops with its control connection, so its session
+            # (and any earlier one set up without a TEARDOWN) ends too
+            for sid in used:
+                s = self.sessions.pop(sid, None)
+                if s:
+                    s.stop.set()
             conn.close()
             print(f"[server] control connection {addr} closed")
 
@@ -258,6 +268,15 @@ class TmnsRtspServer:
         sid = headers.get("session", "").split(";")[0].strip()
         if sid in self.sessions:
             self.sessions[sid].last_activity = time.time()
+
+    def _expire_idle(self):
+        """Drop sessions idle past the timeout (caller holds self._lock)."""
+        now = time.time()
+        for sid, s in list(self.sessions.items()):
+            if now - s.last_activity > self.session_timeout:
+                s.stop.set()
+                self.sessions.pop(sid, None)
+                print(f"[server] session {sid} expired")
 
     def _lookup(self, headers):
         sid = headers.get("session", "").split(";")[0].strip()
@@ -297,9 +316,28 @@ class TmnsRtspServer:
             if "TMNS/TMNSP" not in transport.upper():
                 self._reply(conn, cseq, 461, "Unsupported Transport")
                 return sess
-            self._sid += 1
-            sess = Session(f"{self._sid:08X}")
-            sess.speed = self.speed
+            if headers.get("session"):
+                # SETUP on an existing session changes its transport (RFC 2326
+                # 10.4); refused while its stream runs (playing or paused)
+                sess, err = self._lookup(headers)
+                if err:
+                    self._reply(conn, cseq, 454, "Session Not Found")
+                    return None
+                if sess.thread and sess.thread.is_alive():
+                    self._reply(conn, cseq, 455, "Method Not Valid in This State")
+                    return sess
+            else:
+                with self._lock:
+                    self._expire_idle()
+                    if self.max_sessions and len(self.sessions) >= self.max_sessions:
+                        print(f"[server] SETUP refused: {len(self.sessions)} "
+                              f"session(s), --max-sessions {self.max_sessions}")
+                        self._reply(conn, cseq, 503, "Service Unavailable")
+                        return sess
+                    self._sid += 1
+                    sess = Session(f"{self._sid:08X}")
+                    sess.speed = self.speed
+                    self.sessions[sess.sid] = sess
             m = re.search(r"TMNS/TMNSP/(TCP|UDP)", transport, re.I)
             if m:
                 sess.lower = m.group(1).upper()
@@ -308,7 +346,6 @@ class TmnsRtspServer:
                 sess.client_port = int(m.group(1))
             m = re.search(r"destination=([\d.]+)", transport)
             sess.dest = m.group(1) if m else addr[0]
-            self.sessions[sess.sid] = sess
             self._reply(conn, cseq, 200, "OK",
                         {"Session": f"{sess.sid};timeout={self.session_timeout}",
                          "Transport": transport.split(",")[0].strip()})
@@ -467,13 +504,16 @@ def main():
     ap.add_argument("--speed", type=float, default=1.0,
                     help="playback speed multiplier for real-time pacing "
                          "(default 1.0; a client Speed header overrides it)")
+    ap.add_argument("--max-sessions", type=int, default=0,
+                    help="most RTSP sessions open at once; a SETUP beyond it gets "
+                         "503 Service Unavailable (default 0 = unlimited)")
     ap.add_argument("--asap", action="store_true",
                     help="ignore timestamps and send as fast as possible")
     args = ap.parse_args()
 
     library = Library(load_recordings(args))
     TmnsRtspServer(library, args.port, args.session_timeout,
-                   args.speed, args.asap).serve()
+                   args.speed, args.asap, args.max_sessions).serve()
 
 
 if __name__ == "__main__":

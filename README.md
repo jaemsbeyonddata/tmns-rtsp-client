@@ -457,7 +457,26 @@ python3 tmns_rtsp_server.py --tmns-dir recordings/ --index-dir indexes/ --port 5
 
 Each `X.tmns` is paired with `X.index`; recordings are sorted by start time and
 streamed in order for the requested Range. The server implements the full
-control channel and **passes the 19-check conformance suite**.
+control channel and **passes the conformance suite** (19 checks over UDP, 20
+over TCP).
+
+### Sessions (both servers)
+
+Chapter 26 sets no number of sessions a source must support, and no rule for
+methods sent out of order; both come from RFC 2326. The two servers apply it
+like this:
+
+- `--max-sessions N` caps the open sessions. A SETUP past the cap gets
+  `503 Service Unavailable`. A session that has gone quiet for longer than
+  `--session-timeout` is dropped before counting, so it doesn't hold a slot.
+  The default `0` means no cap.
+- A SETUP with no `Session` header opens a new session. A SETUP that carries
+  the `Session` header of an existing session changes that session's
+  transport. While its stream is running (playing or paused) that's refused
+  with `455 Method Not Valid in This State`; `teardown` first. An unknown
+  session id gets `454`.
+- Closing the control connection ends every session set up on it, including
+  an earlier one that never got a TEARDOWN.
 
 ### Wrapping Chapter 10/11 into a recording (Appendix 24-A)
 

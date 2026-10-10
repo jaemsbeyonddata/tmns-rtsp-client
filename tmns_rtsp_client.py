@@ -2377,6 +2377,14 @@ def cmd_interactive(args) -> int:
             if r.ok:
                 sess["rtsp"] = "READY"
                 start_session_keepalive()  # keep alive until TEARDOWN
+            elif c.session:
+                # the existing session is still open on the server; keep it
+                # alive (455: it is streaming, so it can't be set up again)
+                start_session_keepalive()
+                sess["rtsp"] = "READY"
+                if r.status_code == 455:
+                    cprint("! session is streaming; 'teardown' before a new "
+                           "'setup' ('play' resumes it)", C.YELLOW)
         elif cmd in ("play", "resume"):
             if not data:
                 cprint("! run 'setup' first", C.YELLOW); return None
