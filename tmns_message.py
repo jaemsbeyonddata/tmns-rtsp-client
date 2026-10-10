@@ -240,6 +240,8 @@ def iter_messages(f: BinaryIO, start_offset: Optional[int] = None
         if len(hdr) < DATAMSG_HEADER_LEN:
             return
         h = parse_header(hdr)
+        if h["length"] < DATAMSG_HEADER_LEN:
+            return                       # corrupt MessageLength; stop here
         rest = f.read(h["length"] - DATAMSG_HEADER_LEN)
         if len(rest) < h["length"] - DATAMSG_HEADER_LEN:
             return

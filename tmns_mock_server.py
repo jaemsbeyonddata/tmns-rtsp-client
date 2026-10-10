@@ -227,7 +227,10 @@ class MockSource:
                         headers[k.strip().lower()] = v.strip()
                 clen = int(headers.get("content-length", "0") or "0")
                 while len(buf) < clen:
-                    buf += conn.recv(4096)
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        raise ConnectionError
+                    buf += chunk
                 buf = buf[clen:]
                 sess = self._dispatch(conn, method.upper(), uri, headers, addr, sess)
         except (ConnectionError, OSError):

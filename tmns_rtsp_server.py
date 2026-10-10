@@ -231,7 +231,10 @@ class TmnsRtspServer:
                         headers[k.strip().lower()] = v.strip()
                 clen = int(headers.get("content-length", "0") or "0")
                 while len(buf) < clen:
-                    buf += conn.recv(4096)
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        raise ConnectionError
+                    buf += chunk
                 buf = buf[clen:]
                 sess = self._dispatch(conn, method.upper(), uri, headers, addr, sess)
         except (ConnectionError, OSError):
@@ -296,6 +299,7 @@ class TmnsRtspServer:
                 return sess
             self._sid += 1
             sess = Session(f"{self._sid:08X}")
+            sess.speed = self.speed
             m = re.search(r"TMNS/TMNSP/(TCP|UDP)", transport, re.I)
             if m:
                 sess.lower = m.group(1).upper()

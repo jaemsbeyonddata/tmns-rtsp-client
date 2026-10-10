@@ -213,6 +213,17 @@ def parse_size(text: str) -> int:
                               "g": 1 << 30}[m.group(2).lower()]
 
 
+def parse_port(text: str) -> int:
+    """argparse type: a TCP/UDP port number (1-65535)."""
+    try:
+        port = int(text)
+    except ValueError:
+        port = -1
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"invalid port {text!r} (1-65535)")
+    return port
+
+
 def fmt_hms(seconds: float) -> str:
     """Format a duration as H:MM:SS."""
     s = int(seconds)
@@ -526,7 +537,11 @@ class RTSPClient:
             headers[name.strip().lower()] = val.strip()
 
         body = b""
-        clen = int(headers.get("content-length", "0") or "0")
+        try:
+            clen = int(headers.get("content-length", "0") or "0")
+        except ValueError:
+            raise RTSPError(f"malformed Content-Length: "
+                            f"{headers['content-length']!r}")
         if clen:
             while len(self._buf) < clen:
                 chunk = self._recv()
@@ -1125,7 +1140,7 @@ class DataChannel:
         if self.lower == "UDP":
             self.sock.setblocking(False)     # drained in batches per wake-up
             sel.register(self.sock, selectors.EVENT_READ, data="udp")
-        elif self.conn is not None:
+        elif self.conn is not None and not self._conn_stale():
             # TCP: the data connection outlives a stop/pause and is reused by
             # the next PLAY; it is only closed by TEARDOWN (close())
             sel.register(self.conn, selectors.EVENT_READ, data="tcp")
@@ -1301,6 +1316,22 @@ class DataChannel:
             cprint(f"    data: mdid={m.mdid} seq={m.seq} len={m.length} "
                    f"flags=0x{m.flags:04x} ({pb}){tag}", C.MAGENTA)
 
+    def _conn_stale(self) -> bool:
+        """Drop a kept TCP data connection the source closed while idle.
+
+        A source that closes after End-of-Data connects again on the next
+        PLAY; reading the old connection would end that receive at once.
+        """
+        try:
+            alive = bool(self.conn.recv(1, socket.MSG_PEEK))
+        except (BlockingIOError, InterruptedError):
+            alive = True                 # open, nothing queued yet
+        except OSError:
+            alive = False                # reset by the source
+        if not alive:
+            self._drop_conn()
+        return not alive
+
     def _drop_conn(self) -> None:
         if self.conn is not None:
             try:
@@ -1356,9 +1387,7 @@ class ConformanceTester:
 
     def _reconnect(self) -> None:
         """Get a clean control connection + session state for an isolated test."""
-        self.c.close()
-        self.c.session = None
-        self.c.connect()
+        self.c.reconnect()
 
     def _mkchannel(self) -> "DataChannel":
         return DataChannel(self.data_lower, self.client_port, verbose=self.c.verbose,
@@ -1384,7 +1413,7 @@ class ConformanceTester:
         # unknown/unsupported method -> 501 Not Implemented or 405 Method Not Allowed
         self._expect(
             "Unknown method rejected (501/405)",
-            lambda: c.request("FLYAWAY", self.uri) if (c := self.c) else None,
+            lambda: self.c.request("FLYAWAY", self.uri),
             {501, 405})
 
         # SETUP with a non-TmNS transport profile -> 461 Unsupported Transport
@@ -1446,6 +1475,8 @@ class ConformanceTester:
         if detail:
             line += C.wrap(f"  -- {detail}", C.DIM)
         print(line)
+        _log_write(f"[{' PASS ' if passed else ' FAIL '}] {name}"
+                   + (f"  -- {detail}" if detail else ""))
         return passed
 
     def run(self) -> bool:
@@ -1460,9 +1491,10 @@ class ConformanceTester:
             self._add("OPTIONS advertises required methods in Public header",
                       not missing and bool(advertised),
                       f"Public: {public!r}" if missing else f"{sorted(advertised)}")
-            self._add("OPTIONS echoes CSeq",
-                      r.header("cseq") == str(self.c.cseq), r.header("cseq") or "missing")
-        except RTSPError as e:
+            echoed = (r.header("cseq") or "").strip()
+            self._add("OPTIONS echoes CSeq", echoed == str(self.c.cseq),
+                      echoed or "missing")
+        except (RTSPError, OSError) as e:
             self._add("OPTIONS returns 2xx", False, str(e))
 
         # 2. SETUP
@@ -1503,14 +1535,19 @@ class ConformanceTester:
                               f"mdids={sorted(stats.by_mdid)}")
                     self._add("No sequence gaps observed", stats.gaps == 0,
                               f"{stats.gaps} gap(s)")
-            except RTSPError as e:
+                    if data.lower == "TCP":
+                        self._add("TCP data channel not dropped by the source",
+                                  not stats.peer_closed,
+                                  "closed before End-of-Data" if stats.peer_closed
+                                  else "ok")
+            except (RTSPError, OSError) as e:
                 self._add("PLAY returns 2xx", False, str(e))
 
             # 4. PAUSE
             try:
                 r = self.c.pause(self.uri)
                 self._add("PAUSE returns 2xx", r.ok, f"{r.status_code} {r.reason}")
-            except RTSPError as e:
+            except (RTSPError, OSError) as e:
                 self._add("PAUSE returns 2xx", False, str(e))
 
             # 4b. OPTIONS mid-session refreshes/keeps the session (keep-alive path)
@@ -1518,7 +1555,7 @@ class ConformanceTester:
                 r = self.c.options(self.uri)
                 self._add("OPTIONS mid-session (keep-alive) returns 2xx",
                           r.ok, f"{r.status_code} {r.reason}")
-            except RTSPError as e:
+            except (RTSPError, OSError) as e:
                 self._add("OPTIONS mid-session (keep-alive) returns 2xx", False, str(e))
 
             # 4c. Second PLAY after PAUSE (resume/replay on the same session)
@@ -1527,14 +1564,14 @@ class ConformanceTester:
                 if self._add("Second PLAY after PAUSE returns 2xx (resume)",
                              r.ok, f"{r.status_code} {r.reason}") and r.ok:
                     self.c.pause(self.uri)      # settle back to READY before teardown
-            except RTSPError as e:
+            except (RTSPError, OSError) as e:
                 self._add("Second PLAY after PAUSE returns 2xx (resume)", False, str(e))
 
             # 5. TEARDOWN
             try:
                 r = self.c.teardown(self.uri)
                 self._add("TEARDOWN returns 2xx", r.ok, f"{r.status_code} {r.reason}")
-            except RTSPError as e:
+            except (RTSPError, OSError) as e:
                 self._add("TEARDOWN returns 2xx", False, str(e))
 
         data.close()
@@ -1554,7 +1591,7 @@ class ConformanceTester:
 
 def add_common_target_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("host", help="RTSPDataSource host (IPv4 or name)")
-    p.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
+    p.add_argument("-p", "--port", type=parse_port, default=DEFAULT_PORT,
                    help=f"control-channel TCP port (default {DEFAULT_PORT})")
     p.add_argument("-t", "--timeout", type=float, default=10.0,
                    help="socket timeout seconds (default 10)")
@@ -1576,7 +1613,7 @@ def add_uri_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--delivery-mdid", type=int, help="delivery MDID for pdid/measid requests")
     p.add_argument("--delivery-pdid", type=int, help="delivery PDID for measid requests")
     p.add_argument("--dest-ip", help="TmNSdestIP for delivered data")
-    p.add_argument("--dest-port", type=int, help="TmNSdestport for delivered data")
+    p.add_argument("--dest-port", type=parse_port, help="TmNSdestport for delivered data")
     p.add_argument("--playback", choices=["l", "p"], help="playback opt (l=live, p=playback)")
     p.add_argument("--timeopt", choices=["o", "c"], help="time opt (o=original, c=current)")
     p.add_argument("--dscp", type=int, help="delivery DSCP")
@@ -1588,9 +1625,9 @@ def add_transport_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cast", choices=["unicast", "multicast"], default="unicast")
     p.add_argument("--destination", help="Transport destination= address")
     p.add_argument("--ttl", type=int, help="Transport ttl= for multicast")
-    p.add_argument("--client-port", type=int, default=6970,
+    p.add_argument("--client-port", type=parse_port, default=6970,
                    help="local data-channel port (default 6970)")
-    p.add_argument("--client-port-hi", type=int, help="high end of client_port range")
+    p.add_argument("--client-port-hi", type=parse_port, help="high end of client_port range")
     p.add_argument("--group", help="multicast group to join for UDP reception "
                    "(if the server delivers to a multicast address); also sets "
                    "the Transport destination")
@@ -1775,32 +1812,37 @@ def cmd_stream(args) -> int:
         cprint(f"OPTIONS -> {r.status_code} {r.reason}  Public: {r.header('public','')}",
                C.GREEN if r.ok else C.RED)
         data = make_data_channel(args)
-        data.open()
-        r = c.setup(uri, transport)
-        cprint(f"SETUP   -> {r.status_code} {r.reason}  Session: {c.session}  "
-               f"Transport: {r.header('transport','')}", C.GREEN if r.ok else C.RED)
-        if not r.ok:
+        try:
+            data.open()
+            r = c.setup(uri, transport)
+            cprint(f"SETUP   -> {r.status_code} {r.reason}  Session: {c.session}  "
+                   f"Transport: {r.header('transport','')}",
+                   C.GREEN if r.ok else C.RED)
+            if not r.ok:
+                return 1
+            apply_server_transport(data, c, args.lower)
+            r = c.play(uri, prange=args.range, speed=args.speed,
+                       bandwidth=args.bandwidth)
+            cprint(f"PLAY    -> {r.status_code} {r.reason}", C.GREEN if r.ok else C.RED)
+            play_ok = r.ok
+            if play_ok:
+                dur = args.play_seconds if args.play_seconds > 0 else None
+                ka, ka_int = make_keepalive(c, uri, args.keepalive,
+                                            args.keepalive_method)
+                cprint("* Receiving "
+                       + (f"for {args.play_seconds:g}s" if dur else "until End-of-Data")
+                       + (f", stats every {args.stats_interval:g}s"
+                          if args.stats_interval > 0 else "")
+                       + (f", keep-alive every {ka_int:g}s" if ka_int else "")
+                       + " ...", C.DIM)
+                stats = data.receive(dur, stats_interval=args.stats_interval,
+                                     keepalive=ka, keepalive_interval=ka_int)
+                print_play_summary(stats)
+            r = c.teardown(uri)
+            cprint(f"TEARDOWN-> {r.status_code} {r.reason}", C.GREEN if r.ok else C.RED)
+        finally:
             data.close()
-            return 1
-        apply_server_transport(data, c, args.lower)
-        r = c.play(uri, prange=args.range, speed=args.speed, bandwidth=args.bandwidth)
-        cprint(f"PLAY    -> {r.status_code} {r.reason}", C.GREEN if r.ok else C.RED)
-        if r.ok:
-            dur = args.play_seconds if args.play_seconds > 0 else None
-            ka, ka_int = make_keepalive(c, uri, args.keepalive, args.keepalive_method)
-            cprint("* Receiving "
-                   + (f"for {args.play_seconds:g}s" if dur else "until End-of-Data")
-                   + (f", stats every {args.stats_interval:g}s"
-                      if args.stats_interval > 0 else "")
-                   + (f", keep-alive every {ka_int:g}s" if ka_int else "")
-                   + " ...", C.DIM)
-            stats = data.receive(dur, stats_interval=args.stats_interval,
-                                 keepalive=ka, keepalive_interval=ka_int)
-            print_play_summary(stats)
-        r = c.teardown(uri)
-        cprint(f"TEARDOWN-> {r.status_code} {r.reason}", C.GREEN if r.ok else C.RED)
-        data.close()
-    return 0
+    return 0 if play_ok else 1
 
 
 def cmd_method(args) -> int:
@@ -1928,8 +1970,8 @@ CONFIG_KEYS = {
     "stats_interval": (float, False, "foreground running-stats interval (s)"),
     "lower": (str, True, "data lower-transport UDP|TCP (next setup)"),
     "cast": (str, True, "unicast|multicast (next setup)"),
-    "client_port": (int, True, "data-channel port (next setup)"),
-    "client_port_hi": (int, True, "high end of client_port range"),
+    "client_port": (parse_port, True, "data-channel port (next setup)"),
+    "client_port_hi": (parse_port, True, "high end of client_port range"),
     "destination": (str, True, "Transport destination= address (next setup)"),
     "group": (str, True, "multicast group to join (next setup)"),
     "interface": (str, True, "local interface IP for multicast (next setup)"),
@@ -1950,6 +1992,8 @@ def parse_config_value(key: str, val_str: str):
         return True, None
     try:
         value = typ(val_str)
+    except argparse.ArgumentTypeError as e:
+        return False, str(e)
     except ValueError:
         return False, f"invalid {typ.__name__} value: {val_str!r}"
     if key in _CONFIG_CHOICES:
@@ -2032,7 +2076,7 @@ def _keepalive_line(args, ka_status) -> str:
         return "off"
     when = (f"every {args.keepalive:g}s" if getattr(args, "keepalive", None)
             else "auto (session_timeout/2)")
-    return f"{args.keepalive_method}, {when} (starts at 'play')"
+    return f"{args.keepalive_method}, {when} (starts at 'setup')"
 
 
 def _print_interactive_help(uri: str, transport: str, args, session,
@@ -2117,8 +2161,16 @@ def cmd_interactive(args) -> int:
             while not ev.wait(interval):       # fires every `interval` seconds
                 try:
                     ping()
-                except (RTSPError, OSError):
-                    pass                        # surfaced via the next command
+                except (RTSPError, OSError) as e:
+                    if _connection_dead(e) and not ev.is_set():
+                        # the next command reconnects; say so now, since the
+                        # session expires meanwhile
+                        cprint(f"\n! keep-alive: control connection lost ({e}); "
+                               f"the next command reconnects", C.YELLOW)
+                        ka_status["active"] = False
+                        with c._lock:
+                            c.close()       # so 'status' shows it as down
+                        return
         ka_task["thread"] = threading.Thread(target=loop, daemon=True)
         ka_task["thread"].start()
         ka_status["active"] = True
@@ -2328,17 +2380,25 @@ def cmd_interactive(args) -> int:
         elif cmd in ("play", "resume"):
             if not data:
                 cprint("! run 'setup' first", C.YELLOW); return None
+            secs = None
+            if cmd == "play" and len(parts) > 1:
+                try:
+                    secs = float(parts[1])
+                except ValueError:
+                    cprint(f"! usage: play [secs]  (got {parts[1]!r})", C.YELLOW)
+                    return None
             r = c.play(uri, prange=args.range, speed=args.speed,
                        bandwidth=args.bandwidth)
-            if r.ok:
-                sess["rtsp"] = "PLAYING"
+            if not r.ok:
+                return None
+            sess["rtsp"] = "PLAYING"
             if bg_active():
                 cprint("* resumed (streaming in background; "
                        "'stats' / 'pause' / 'stop')", C.DIM)
-            elif cmd == "play" and len(parts) > 1:
+            elif secs is not None:
                 # foreground bounded receive (blocking) for N seconds; the
                 # persistent keep-alive thread keeps the session alive meanwhile
-                secs = float(parts[1]); dur = secs if secs > 0 else None
+                dur = secs if secs > 0 else None
                 cprint("* Receiving "
                        + (f"for {secs:g}s" if dur else "until End-of-Data")
                        + " (Ctrl-C to stop) ...", C.DIM)
@@ -2392,7 +2452,9 @@ def cmd_interactive(args) -> int:
                 _print_sdp(r.body)
         elif cmd == "get":
             c.get_parameter(uri, parts[1:] or None)
-        elif cmd == "set" and len(parts) >= 3:
+        elif cmd == "set":
+            if len(parts) < 3:
+                cprint("! usage: set <key> <value...>", C.YELLOW); return None
             c.set_parameter(uri, {parts[1]: " ".join(parts[2:])})
         else:
             cprint(f"? unknown command: {cmd}  (type 'help')", C.YELLOW)
@@ -2411,6 +2473,8 @@ def cmd_interactive(args) -> int:
             try:
                 if handle(cmd, parts) == "quit":
                     break
+            except ValueError as e:      # bad argument; the session is intact
+                cprint(f"! {e}", C.RED)
             except (RTSPError, OSError) as e:
                 if not _connection_dead(e):
                     cprint(f"! {e}", C.RED)

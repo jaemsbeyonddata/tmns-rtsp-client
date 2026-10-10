@@ -91,7 +91,9 @@ python3 tmns_rtsp_client.py test 10.0.0.5 \
 methods; CSeq echo; SETUP 2xx with `Session` + `Transport`; PLAY 2xx with an
 active session; data received on the data channel; no per-MDID sequence gaps;
 PAUSE 2xx; OPTIONS mid-session (keep-alive path) 2xx; a **second PLAY after
-PAUSE** (resume/replay on the same session) 2xx; TEARDOWN 2xx.
+PAUSE** (resume/replay on the same session) 2xx; TEARDOWN 2xx. With
+`--lower TCP`, also that the source did not close the data connection before
+End-of-Data.
 
 **Negative checks:**
 
@@ -135,6 +137,11 @@ At the end of the PLAY it prints a **summary** of the data received:
   kernel drops  : 0
   end-of-data   : yes
 ```
+
+`end-of-data` is `yes` only when the End-of-Data message arrived. If a TCP
+source closes the data connection without sending it, the line reads
+`no -- data connection closed by the source`. `stream` exits with `1` if SETUP
+or PLAY is rejected.
 
 MDIDs/PDIDs are shown as compact ranges (e.g. `1-4,7`). Sequence gaps are
 detected per-MDID (`MessageDefinitionSequenceNumber`, Ch.26 §26.5.1); the
@@ -294,7 +301,9 @@ design; use `stats` for totals on demand.
 **A TCP data connection lasts until `teardown`.** Once the source connects,
 `stop`, `pause` and `play` keep reading from the same connection, and any bytes
 of a partly received message are kept so the stream stays aligned. The client
-waits for a new connection only after `teardown` (or if the source closes it).
+waits for a new connection only after `teardown`, or if the source closes it
+(a source that closes after End-of-Data and connects again on the next PLAY
+works too).
 A quiet connection is never timed out, so a PLAY whose `ptp-clock` range starts
 in the future can sit idle until the source starts sending. While stopped,
 nothing reads the connection, so the source is held back by TCP flow control
