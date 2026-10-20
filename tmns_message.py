@@ -51,9 +51,12 @@ plus a time-ordered index for fast Range search during RTSP playback (Ch.26).
 """
 
 import bisect
+import heapq
 import mmap
 import os
+import shutil
 import struct
+import tempfile
 import time
 from typing import BinaryIO, Iterator, List, Optional, Tuple
 
@@ -200,40 +203,148 @@ _IDX_TS = struct.Struct(">Q")
 READ_CHUNK = 4 << 20                   # bytes per read when streaming a .tmns
 
 class RecordWriter:
-    """Write TmNSDataMessages to a .tmns file, collecting index entries."""
+    """Write TmNSDataMessages to a .tmns file and its .index.
 
-    def __init__(self, path: str):
+    Index entries are streamed to a temporary file beside the .index as
+    messages are written, so memory stays flat however large the recording.
+    close() then writes the .index: entries already in time order are copied
+    straight across; otherwise they are merge-sorted in bounded runs.
+    """
+
+    BUFFERED = 65536            # entries packed in memory before a flush
+    SORT_RUN = 1 << 20          # entries sorted in memory per run
+    FAN_IN = 64                 # runs merged at once (bounds open files)
+
+    def __init__(self, path: str, index_path: Optional[str] = None):
+        self.path = path
+        self.index_path = index_path or os.path.splitext(path)[0] + ".index"
         self.f = open(path, "wb")
         self.f.write(REC_MAGIC + struct.pack(">H6x", REC_VERSION))
-        self.entries: List[Tuple[int, int, int, int]] = []   # ts, offset, mdid, len
+        self.offset = REC_HEADER_LEN
+        self._tmp = tempfile.NamedTemporaryFile(
+            dir=os.path.dirname(os.path.abspath(self.index_path)),
+            prefix=".index-", suffix=".part", delete=False)
+        self._buf: List[bytes] = []
         self.count = 0
+        self.start_ts: Optional[int] = None      # earliest MessageTimestamp
+        self.end_ts: Optional[int] = None        # latest MessageTimestamp
+        self.mdids: set = set()
+        self.time_ordered = True                 # timestamps never went back
+        self._last_ts = 0
 
     def write(self, msg: bytes) -> None:
-        offset = self.f.tell()
-        h = parse_header(msg)
+        _w0, mdid, _seq, length, ts = _MSG_HDR.unpack_from(msg)
         self.f.write(msg)
-        self.entries.append((h["timestamp"], offset, h["mdid"], h["length"]))
+        self._buf.append(_IDX_ENTRY.pack(ts, self.offset, mdid, length))
+        if len(self._buf) >= self.BUFFERED:
+            self._flush()
+        self.offset += len(msg)
         self.count += 1
+        self.mdids.add(mdid)
+        if self.start_ts is None:
+            self.start_ts = self.end_ts = ts
+        else:
+            if ts < self._last_ts:
+                self.time_ordered = False
+            self.start_ts = min(self.start_ts, ts)
+            self.end_ts = max(self.end_ts, ts)
+        self._last_ts = ts
+
+    def _flush(self) -> None:
+        self._tmp.write(b"".join(self._buf))
+        self._buf = []
 
     def close(self) -> None:
+        """Finish the .tmns, then write its .index."""
+        if self.f.closed:
+            return
         self.f.close()
+        self._flush()
+        self._tmp.close()
+        try:
+            with open(self.index_path, "wb") as out:
+                out.write(IDX_MAGIC + struct.pack(
+                    ">HIQ2x", IDX_VERSION, self.count & 0xFFFFFFFF, self.offset))
+                if self.time_ordered:
+                    with open(self._tmp.name, "rb") as src:
+                        shutil.copyfileobj(src, out, 16 << 20)
+                else:
+                    self._sort_into(out)
+        finally:
+            os.remove(self._tmp.name)
+
+    def _sort_into(self, out: BinaryIO) -> None:
+        """External merge sort of the temporary entries by (ts, offset).
+
+        Sorting on the offset too keeps messages with equal timestamps in
+        file order, as a stable sort would.
+        """
+        runs = []
+        try:
+            with open(self._tmp.name, "rb") as src:
+                while True:
+                    block = src.read(self.SORT_RUN * IDX_ENTRY_LEN)
+                    if not block:
+                        break
+                    run = sorted(_IDX_ENTRY.iter_unpack(block))
+                    if not runs and len(block) < self.SORT_RUN * IDX_ENTRY_LEN:
+                        _write_entries(out, run)     # fits in one run
+                        return
+                    runs.append(self._spill(run))
+            # merge at most FAN_IN runs at a time, in passes, so a huge
+            # unordered recording never needs thousands of open files
+            while len(runs) > self.FAN_IN:
+                group, runs = runs[:self.FAN_IN], runs[self.FAN_IN:]
+                runs.append(self._spill(
+                    heapq.merge(*(_read_entries(r) for r in group))))
+                for r in group:
+                    r.close()
+            _write_entries(out, heapq.merge(*(_read_entries(r) for r in runs)))
+        finally:
+            for r in runs:
+                r.close()
+
+    def _spill(self, entries) -> BinaryIO:
+        """Write sorted entries to an anonymous temp file, rewound to read."""
+        tmp = tempfile.TemporaryFile(
+            dir=os.path.dirname(os.path.abspath(self.index_path)))
+        _write_entries(tmp, entries)
+        tmp.seek(0)
+        return tmp
+
+
+def _write_entries(f: BinaryIO, entries) -> None:
+    pack, chunk = _IDX_ENTRY.pack, []
+    for e in entries:
+        chunk.append(pack(*e))
+        if len(chunk) >= 65536:
+            f.write(b"".join(chunk))
+            chunk = []
+    f.write(b"".join(chunk))
+
+
+def _read_entries(f: BinaryIO) -> Iterator[Tuple[int, int, int, int]]:
+    while True:
+        block = f.read(65536 * IDX_ENTRY_LEN)
+        if not block:
+            return
+        yield from _IDX_ENTRY.iter_unpack(block)
 
 
 def write_index(path: str, entries: List[Tuple[int, int, int, int]],
                 tmns_size: int = 0) -> None:
-    """Write a time-ordered .index from (ts, offset, mdid, length) tuples.
+    """Write a time-ordered .index from an in-memory list of
+    (ts, offset, mdid, length) tuples (RecordWriter streams its own).
 
     tmns_size is the byte size of the corresponding .tmns file, stored so the
     index can be verified against (linked to) exactly one .tmns file.
     """
     if any(entries[i][0] > entries[i + 1][0] for i in range(len(entries) - 1)):
         entries = sorted(entries, key=lambda e: e[0])
-    pack = _IDX_ENTRY.pack
     with open(path, "wb") as f:
         f.write(IDX_MAGIC + struct.pack(">HIQ2x", IDX_VERSION,
                                         len(entries) & 0xFFFFFFFF, tmns_size))
-        for i in range(0, len(entries), 65536):
-            f.write(b"".join(pack(*e) for e in entries[i:i + 65536]))
+        _write_entries(f, entries)
 
 
 def iter_messages(f: BinaryIO, start_offset: Optional[int] = None

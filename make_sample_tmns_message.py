@@ -94,14 +94,10 @@ def main():
         msg = tm.build_datamsg(args.mdid, i, packages=[pkg],
                                options=tm.build_options(1), playback=True, ts=ts)
         writer.write(msg)
-    writer.close()
+    writer.close()                       # also writes <output>.index
 
-    import os
-    tmns_size = os.path.getsize(f"{args.output}.tmns")
-    tm.write_index(f"{args.output}.index", writer.entries, tmns_size)
-
-    first = writer.entries[0][0] if writer.entries else 0
-    last = writer.entries[-1][0] if writer.entries else 0
+    first = writer.start_ts or 0
+    last = writer.end_ts or 0
     print(f"Wrote {writer.count} TmNSDataMessages to {args.output}.tmns")
     print(f"Wrote {writer.count} index entries to {args.output}.index")
     print(f"  MDID {args.mdid}, PDID {args.pdid} (0x{args.pdid:04x}), "

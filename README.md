@@ -480,6 +480,11 @@ growing in memory:
 - **Exact pacing.** Real-time playback follows one fixed schedule from the
   first message's timestamp, so sleep overhead doesn't accumulate. A gap in
   the recording longer than 2 s (after `--speed`) is shortened to 2 s.
+- **Index writing.** `RecordWriter` (used by `make_sample_tmns_message.py` and
+  `ch10_to_tmns.py`) streams index entries to a temporary file as it writes
+  the `.tmns`, so memory stays flat (~50 MB) however large the recording;
+  on close a time-ordered recording's entries are copied straight into the
+  `.index`, and an out-of-order one is merge-sorted on disk in bounded runs.
 - **Client.** The TCP data channel reads into one reusable 4 MB buffer
   (`recv_into`) and accounts every whole message in it in one tight loop; UDP
   datagrams land in a reusable buffer too. Statistics are unchanged.

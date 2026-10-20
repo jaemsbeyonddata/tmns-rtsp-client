@@ -69,9 +69,7 @@ def convert(ch10_path, out_base, mdid_upper=0, max_msg_bytes=60000,
                       f"dtype={chapter11.data_type_name(pkt.data_type)} "
                       f"seq={pkt.sequence} -> mdid={mdid} pdid=0x{pdid:04x} "
                       f"body={len(body)}B")
-    writer.close()
-    tmns_size = os.path.getsize(out_base + ".tmns")
-    tm.write_index(out_base + ".index", writer.entries, tmns_size)
+    writer.close()                       # also writes <out_base>.index
     return packets, messages, writer, by_pdid
 
 
@@ -101,17 +99,20 @@ def main():
         args.ch10, out, args.mdid_upper, args.max_msg_bytes,
         not args.no_playback, args.verbose)
 
-    first = writer.entries[0][0] if writer.entries else 0
-    last = writer.entries[-1][0] if writer.entries else 0
-    mdids = sorted({e[2] for e in writer.entries})
+    first = writer.start_ts or 0
+    last = writer.end_ts or 0
+    mdids = sorted(writer.mdids)
     print(f"Wrapped {packets} Chapter 11 packet(s) -> {messages} "
           f"TmNSDataMessage(s)")
     print(f"  wrote {out}.tmns and {out}.index")
     print(f"  MDIDs {mdids}, PDIDs "
           f"{[f'0x{p:04x}' for p in sorted(by_pdid)]}")
-    if writer.entries:
+    if writer.count:
         print(f"  time span (PTP s): {tm.ts_to_seconds(first):.3f} .. "
               f"{tm.ts_to_seconds(last):.3f}")
+    if not writer.time_ordered:
+        print("  warning: message timestamps are not in time order in the "
+              ".tmns; Range playback assumes they are")
 
 
 if __name__ == "__main__":
