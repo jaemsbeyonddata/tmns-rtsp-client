@@ -902,10 +902,54 @@ class DataStats:
                     break
                 by_pdid[pdid] = by_pdid.get(pdid, 0) + 1
                 n += 1
-                p = (p + plen + 3) & ~3          # pad to next 32-bit boundary
+                p = off + ((p - off + plen + 3) & ~3)   # 32-bit padding
             self.packages += n
         self._note_seq(mdid, seq, eod, ts)
         return eod
+
+    def note_stream(self, buf, off: int, n: int) -> int:
+        """Account every whole message in buf[off:n]; return the offset after.
+
+        The TCP fast path: note_raw() inlined into one loop over the buffer,
+        with attribute lookups hoisted and only the rare sequence anomaly
+        (gap/duplicate) leaving the loop.  Stops after End-of-Data.
+        """
+        unpack, pkg_unpack = _MSG_HDR.unpack_from, _PKG_HDR.unpack_from
+        by_mdid, by_pdid, last = self.by_mdid, self.by_pdid, self._last_seq
+        msgs = nbytes = pkgs = 0
+        while n - off >= DATAMSG_HEADER_LEN:
+            word0, mdid, seq, length, ts = unpack(buf, off)
+            if length < DATAMSG_HEADER_LEN:
+                off += 1                         # bad length; resync
+                continue
+            end = off + length
+            if end > n:
+                break
+            msgs += 1
+            nbytes += length
+            by_mdid[mdid] = by_mdid.get(mdid, 0) + 1
+            if word0 & FLAG_END_OF_DATA:
+                self.end_of_data = True
+                off = end
+                break
+            if word0 & FLAG_STANDARD_PKG_HEADER:
+                p = off + DATAMSG_HEADER_LEN + ((word0 >> 24) & 0xF) * 4
+                while p + STANDARD_PKG_HEADER_LEN <= end:
+                    pdid, plen = pkg_unpack(buf, p)
+                    if plen < STANDARD_PKG_HEADER_LEN:
+                        break
+                    by_pdid[pdid] = by_pdid.get(pdid, 0) + 1
+                    pkgs += 1
+                    p = off + ((p - off + plen + 3) & ~3)   # 32-bit padding
+            prev = last.get(mdid)
+            if prev is not None and seq != (prev + 1) & 0xFFFFFFFF:
+                self._seq_anomaly(mdid, prev, seq, ts)
+            last[mdid] = seq
+            off = end
+        self.messages += msgs
+        self.bytes += nbytes
+        self.packages += pkgs
+        return off
 
     def _note_seq(self, mdid: int, seq: int, end_of_data: bool, ts: int) -> None:
         # The empty End-of-Data indicator carries mdid=0/seq=0 and is not part
@@ -914,21 +958,25 @@ class DataStats:
             self.end_of_data = True
             return
         prev = self._last_seq.get(mdid)
-        if prev is not None:
-            diff = (seq - prev) & 0xFFFFFFFF       # forward distance (wrap-safe)
-            if diff == 0 or diff > 0x7FFFFFFF:
-                # same seq (duplicate) or a backward jump (reordering)
-                self.dupes += 1
-            elif diff > 1:
-                # forward gap: (diff - 1) messages missing
-                missing = diff - 1
-                self.gaps += 1
-                self.lost += missing
-                self.by_mdid_gaps[mdid] = self.by_mdid_gaps.get(mdid, 0) + 1
-                self.by_mdid_lost[mdid] = self.by_mdid_lost.get(mdid, 0) + missing
-                if _gap_fh is not None:
-                    _gaplog_write(mdid, prev, seq, missing, ts)
+        if prev is not None and seq != (prev + 1) & 0xFFFFFFFF:
+            self._seq_anomaly(mdid, prev, seq, ts)
         self._last_seq[mdid] = seq
+
+    def _seq_anomaly(self, mdid: int, prev: int, seq: int, ts: int) -> None:
+        """Count a sequence number that isn't prev + 1 (wrap-safe)."""
+        diff = (seq - prev) & 0xFFFFFFFF          # forward distance
+        if diff == 0 or diff > 0x7FFFFFFF:
+            # same seq (duplicate) or a backward jump (reordering)
+            self.dupes += 1
+        else:
+            # forward gap: (diff - 1) messages missing
+            missing = diff - 1
+            self.gaps += 1
+            self.lost += missing
+            self.by_mdid_gaps[mdid] = self.by_mdid_gaps.get(mdid, 0) + 1
+            self.by_mdid_lost[mdid] = self.by_mdid_lost.get(mdid, 0) + missing
+            if _gap_fh is not None:
+                _gaplog_write(mdid, prev, seq, missing, ts)
 
 
 def kdrops_field(stats: DataStats, sep: str = "") -> str:
@@ -1011,7 +1059,11 @@ class DataChannel:
         self.rcvbuf_actual: Optional[int] = None   # what the kernel granted
         self.sock: Optional[socket.socket] = None
         self.conn: Optional[socket.socket] = None
-        self._streambuf = b""            # unparsed TCP bytes (partial message)
+        # TCP stream buffer: recv_into() fills it after the _streamlen bytes
+        # of a partial message carried over from the previous read
+        self._streambuf = bytearray(self.TCP_BUF)
+        self._streamlen = 0
+        self._udpbuf = bytearray(65536)  # one datagram at a time (UDP)
         # SO_RXQ_OVFL: the kernel stamps each datagram with the socket's
         # cumulative drop count; None when unsupported on this platform
         self._rxq_ovfl = False
@@ -1166,29 +1218,19 @@ class DataChannel:
                     elif tag == "listen":
                         self.conn, addr = self.sock.accept()
                         self.conn.setblocking(False)
-                        self._streambuf = b""
+                        self._streamlen = 0
                         sel.unregister(self.sock)
                         sel.register(self.conn, selectors.EVENT_READ, data="tcp")
                         if self.verbose:
                             cprint(f"* Data source connected from {addr}", C.DIM)
                     elif tag == "tcp":
-                        try:
-                            chunk = self.conn.recv(65536)
-                        except (BlockingIOError, InterruptedError):
-                            continue
-                        except OSError:
-                            chunk = b""          # reset by the source
-                        if not chunk:
+                        if not self._read_stream(stats):
                             # source closed the connection (a drop, not
                             # End-of-Data): a later PLAY waits for it to
                             # connect again
                             self._drop_conn()
                             stats.peer_closed = True
                             break
-                        # bytes of an incomplete message are kept across
-                        # receive() calls so the stream stays aligned
-                        self._streambuf = self._consume_stream(
-                            self._streambuf + chunk, stats)
 
                 now = time.time()
                 if stats_interval > 0 and now - last_stats >= stats_interval:
@@ -1239,14 +1281,21 @@ class DataChannel:
     UDP_BATCH = 1024    # datagrams read per wake-up before re-checking deadlines
 
     def _drain_udp(self, stats: DataStats) -> None:
-        """Read every queued datagram (up to UDP_BATCH) without re-selecting."""
+        """Read every queued datagram (up to UDP_BATCH) without re-selecting.
+
+        Datagrams land in one reusable buffer (recv_into), so the quiet fast
+        path allocates nothing per datagram.
+        """
         sock = self.sock
         ovfl = self._rxq_ovfl
         cmsg_size = socket.CMSG_SPACE(4)
+        buf = self._udpbuf
+        bufs = [buf]
+        fast = not (self.decode or self.verbose)
         for _ in range(self.UDP_BATCH):
             try:
                 if ovfl:
-                    data, anc, _fl, _addr = sock.recvmsg(65536, cmsg_size)
+                    n, anc, _fl, _addr = sock.recvmsg_into(bufs, cmsg_size)
                     # present only once the socket has dropped something
                     for level, ctype, cdata in anc:
                         if (level == socket.SOL_SOCKET and ctype == _SO_RXQ_OVFL
@@ -1254,20 +1303,20 @@ class DataChannel:
                             self._rxq_drops = struct.unpack("=I", cdata[:4])[0]
                             stats.kernel_drops = self._rxq_drops - self._drops_base
                 else:
-                    data = sock.recv(65536)
+                    n = sock.recv_into(buf)
             except (BlockingIOError, InterruptedError):
                 return
             except ConnectionRefusedError:      # stray ICMP port-unreachable
                 continue
-            self._consume_datagram(data, stats)
+            if fast:
+                if n >= DATAMSG_HEADER_LEN:
+                    stats.note_raw(buf, 0, n)
+            else:
+                self._consume_datagram(bytes(buf[:n]), stats)
             if stats.end_of_data:
                 return
 
     def _consume_datagram(self, data: bytes, stats: DataStats) -> None:
-        if not (self.decode or self.verbose):
-            if len(data) >= DATAMSG_HEADER_LEN:
-                stats.note_raw(data)
-            return
         dm = decode_datamsg(data)
         if dm is None:
             if self.verbose:
@@ -1276,30 +1325,56 @@ class DataChannel:
         stats.note(dm)
         self._report(dm)
 
-    def _consume_stream(self, buf: bytes, stats: DataStats) -> bytes:
-        # walk by offset and slice the remainder once, instead of re-copying
-        # the buffer after every message
-        fast = not (self.decode or self.verbose)
-        off, n = 0, len(buf)
+    TCP_BUF = 4 << 20   # TCP receive buffer; grows for a larger message
+
+    def _read_stream(self, stats: DataStats) -> bool:
+        """Read what the TCP data connection has and account whole messages.
+
+        Reads straight into one reusable buffer (no per-read allocation or
+        concatenation); bytes of an incomplete message stay at its front, so
+        the stream keeps its alignment across reads and receive() calls.
+        Returns False when the source closed or reset the connection.
+        """
+        buf = self._streambuf
+        if self._streamlen == len(buf):
+            buf.extend(bytes(len(buf)))          # one message fills it: grow
+        try:
+            with memoryview(buf) as mv:
+                got = self.conn.recv_into(mv[self._streamlen:])
+        except (BlockingIOError, InterruptedError):
+            return True
+        except OSError:
+            return False                         # reset by the source
+        if not got:
+            return False
+        end = self._streamlen + got
+        off = self._consume_stream(buf, end, stats)
+        if off:
+            buf[:end - off] = buf[off:end]       # keep only the partial tail
+        self._streamlen = end - off
+        return True
+
+    def _consume_stream(self, buf, n: int, stats: DataStats) -> int:
+        """Account whole messages in buf[:n]; return the offset consumed."""
+        if not (self.decode or self.verbose):
+            return stats.note_stream(buf, 0, n)
+        unpack = _MSG_HDR.unpack_from
+        off = 0
         while n - off >= DATAMSG_HEADER_LEN:
-            length = _MSG_HDR.unpack_from(buf, off)[3]
+            length = unpack(buf, off)[3]
             if length < DATAMSG_HEADER_LEN:
                 # bad length; resync by dropping a byte
                 off += 1
                 continue
             if n - off < length:
                 break
-            if fast:
-                eod = stats.note_raw(buf, off, off + length)
-            else:
-                dm = decode_datamsg(buf[off:off + length])
-                stats.note(dm)
-                self._report(dm)
-                eod = dm.header.end_of_data
+            dm = decode_datamsg(bytes(buf[off:off + length]))
+            stats.note(dm)
+            self._report(dm)
             off += length
-            if eod:
+            if dm.header.end_of_data:
                 break
-        return buf[off:]
+        return off
 
     def _report(self, dm: DecodedMessage) -> None:
         if self.decode:
@@ -1339,7 +1414,9 @@ class DataChannel:
             except OSError:
                 pass
         self.conn = None
-        self._streambuf = b""
+        self._streamlen = 0
+        if len(self._streambuf) > self.TCP_BUF:
+            self._streambuf = bytearray(self.TCP_BUF)
 
     def close(self) -> None:
         self._drop_conn()

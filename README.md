@@ -425,7 +425,9 @@ standard Chapter 24 TmNSDataMessages:
 - `.tmns` — a 16-byte header then a sequence of Chapter 24 TmNSDataMessages,
   each framed by its `MessageLength`.
 - `.index` — a time-ordered table `(MessageTimestamp, file_offset, MDID,
-  MessageLength)` for fast Range search.
+  MessageLength)` for fast Range search. Its header's entry count is kept
+  modulo 2^32; readers take the real count from the file size, so an index
+  can hold more than 4G entries.
 
 Generate a PCM recording and play it back:
 
@@ -459,6 +461,41 @@ Each `X.tmns` is paired with `X.index`; recordings are sorted by start time and
 streamed in order for the requested Range. The server implements the full
 control channel and **passes the conformance suite** (19 checks over UDP, 20
 over TCP).
+
+### Large recordings (hundreds of GB)
+
+Both ends are built to stream very large recordings without slowing down or
+growing in memory:
+
+- **Index is memory-mapped.** Opening a `.index` is instant and takes no RAM
+  beyond the page cache, whatever its size; a Range is found by binary search
+  on the mapped file. (MDIDs are listed at start-up only for indexes of up to
+  50M entries, since listing them reads the whole index.)
+- **Zero-copy TCP.** An `--asap` (or `Speed: 0`) PLAY over TCP with no MDID
+  filter sends the Range as file bytes straight to the socket with
+  `sendfile()`, a few MB at a time so PAUSE still takes effect at once.
+- **Large reads, batched writes.** Every other mode reads the `.tmns` in 4 MB
+  chunks and sends messages from them without copying; TCP writes are
+  coalesced up to 256 KB.
+- **Exact pacing.** Real-time playback follows one fixed schedule from the
+  first message's timestamp, so sleep overhead doesn't accumulate. A gap in
+  the recording longer than 2 s (after `--speed`) is shortened to 2 s.
+- **Client.** The TCP data channel reads into one reusable 4 MB buffer
+  (`recv_into`) and accounts every whole message in it in one tight loop; UDP
+  datagrams land in a reusable buffer too. Statistics are unchanged.
+
+On one loopback host (Python 3.12), compared with the previous version:
+
+| Playback | Before | After |
+| --- | --- | --- |
+| TCP `--asap`, 1 KB messages | 110 MiB/s | ~690 MiB/s |
+| TCP `--asap`, 84-byte messages | 156k msg/s | ~920k msg/s |
+| Open a 10M-entry index | 5 s, 1.7 GB RAM | < 1 ms |
+| Paced, 10 kHz recording at 1x / 5x | 5.2k / 9.4k msg/s | 10k / 50k msg/s |
+
+Over UDP every message is its own datagram, so the rate is bounded by the
+receiver's socket buffer: raise `net.core.rmem_max` (see `--rcvbuf`) before a
+fast UDP playback, or prefer TCP for `--asap`.
 
 ### Sessions (both servers)
 

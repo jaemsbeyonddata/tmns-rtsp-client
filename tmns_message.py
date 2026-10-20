@@ -42,12 +42,17 @@ plus a time-ordered index for fast Range search during RTSP playback (Ch.26).
           then entry_count fixed 24-byte, time-ordered entries:
             MessageTimestamp u64 | file_offset u64 | MDID u32 | MessageLength u32
 
+  entry_count holds the count modulo 2**32; a reader takes the real count
+  from the .index size, so an index can hold more than 4G entries.
+
   tmns_size links the index to its .tmns file (the .tmns byte size at index
   time), so a stale/mismatched index can be detected — every .tmns has exactly
   one corresponding .index.
 """
 
 import bisect
+import mmap
+import os
 import struct
 import time
 from typing import BinaryIO, Iterator, List, Optional, Tuple
@@ -189,6 +194,11 @@ def messages_from_packages(mdid: int, packages: List[bytes], seqs: dict, ts: int
 
 # ----- .tmns record writer / reader ---------------------------------------
 
+_MSG_HDR = struct.Struct(">IIIIQ")     # word0, MDID, seq, MessageLength, ts
+_IDX_ENTRY = struct.Struct(">QQII")    # ts, offset, MDID, MessageLength
+_IDX_TS = struct.Struct(">Q")
+READ_CHUNK = 4 << 20                   # bytes per read when streaming a .tmns
+
 class RecordWriter:
     """Write TmNSDataMessages to a .tmns file, collecting index entries."""
 
@@ -216,12 +226,14 @@ def write_index(path: str, entries: List[Tuple[int, int, int, int]],
     tmns_size is the byte size of the corresponding .tmns file, stored so the
     index can be verified against (linked to) exactly one .tmns file.
     """
-    entries = sorted(entries, key=lambda e: e[0])
+    if any(entries[i][0] > entries[i + 1][0] for i in range(len(entries) - 1)):
+        entries = sorted(entries, key=lambda e: e[0])
+    pack = _IDX_ENTRY.pack
     with open(path, "wb") as f:
-        f.write(IDX_MAGIC + struct.pack(">HIQ2x", IDX_VERSION, len(entries),
-                                        tmns_size))
-        for ts, off, mdid, length in entries:
-            f.write(struct.pack(">QQII", ts, off, mdid, length))
+        f.write(IDX_MAGIC + struct.pack(">HIQ2x", IDX_VERSION,
+                                        len(entries) & 0xFFFFFFFF, tmns_size))
+        for i in range(0, len(entries), 65536):
+            f.write(b"".join(pack(*e) for e in entries[i:i + 65536]))
 
 
 def iter_messages(f: BinaryIO, start_offset: Optional[int] = None
@@ -248,25 +260,97 @@ def iter_messages(f: BinaryIO, start_offset: Optional[int] = None
         yield pos, h, hdr + rest
 
 
+def iter_raw(f: BinaryIO, start_offset: int, end_offset: Optional[int] = None,
+             chunk: int = READ_CHUNK) -> Iterator[Tuple[int, int, memoryview]]:
+    """Yield (timestamp, mdid, message) from a .tmns, from start_offset on.
+
+    The fast reader for playback: it reads the file in large chunks and
+    yields each message as a memoryview into its chunk (no copy, no header
+    dict), so sending it costs one syscall and no Python-level buffering.
+    Stops before end_offset if given, or at a short/corrupt message.
+    """
+    unpack = _MSG_HDR.unpack_from
+    f.seek(start_offset)
+    pos = start_offset
+    buf = memoryview(b"")
+    off = 0
+    while end_offset is None or pos < end_offset:
+        if len(buf) - off < DATAMSG_HEADER_LEN:
+            want = chunk if end_offset is None else min(chunk, end_offset - pos)
+            more = f.read(max(want, DATAMSG_HEADER_LEN))
+            buf = memoryview(bytes(buf[off:]) + more)
+            off = 0
+            if len(buf) < DATAMSG_HEADER_LEN:
+                return
+        _w0, mdid, _seq, length, ts = unpack(buf, off)
+        if length < DATAMSG_HEADER_LEN:
+            return                       # corrupt MessageLength; stop here
+        if len(buf) - off < length:
+            more = f.read(max(chunk, length - (len(buf) - off)))
+            buf = memoryview(bytes(buf[off:]) + more)
+            off = 0
+            if len(buf) < length:
+                return
+        yield ts, mdid, buf[off:off + length]
+        off += length
+        pos += length
+
+
 # ----- .index reader with time search -------------------------------------
 
+class _Entries:
+    """Read-only sequence view of the index entries in a mapped .index.
+
+    Entries are unpacked on access, so a huge index costs no memory; this is
+    what keeps load time and RAM flat for very large recordings.
+    """
+
+    def __init__(self, buf, count: int, item):
+        self._buf, self._n, self._item = buf, count, item
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, i):
+        if i < 0:
+            i += self._n
+        if not 0 <= i < self._n:
+            raise IndexError("index entry out of range")
+        return self._item(self._buf, IDX_HEADER_LEN + i * IDX_ENTRY_LEN)
+
+
 class Index:
-    """A loaded .index: time-ordered entries with binary-search helpers."""
+    """A .index mapped from disk: time-ordered entries with binary search.
+
+    The file is memory-mapped rather than read into a list, so opening an
+    index of any size is instant and costs no memory beyond the page cache.
+    """
 
     def __init__(self, path: str):
         self.path = path
-        self.entries: List[Tuple[int, int, int, int]] = []   # ts, offset, mdid, len
+        self._mm = None
         with open(path, "rb") as f:
             hdr = f.read(IDX_HEADER_LEN)
             if len(hdr) < IDX_HEADER_LEN or hdr[:8] != IDX_MAGIC:
                 raise ValueError(f"{path}: not a TmNS .index file")
             _ver, count, self.tmns_size = struct.unpack(">HIQ", hdr[8:22])
-            for _ in range(count):
-                rec = f.read(IDX_ENTRY_LEN)
-                if len(rec) < IDX_ENTRY_LEN:
-                    break
-                self.entries.append(struct.unpack(">QQII", rec))
-        self._ts = [e[0] for e in self.entries]
+            size = os.fstat(f.fileno()).st_size
+            n = (size - IDX_HEADER_LEN) // IDX_ENTRY_LEN
+            # entry_count is the count modulo 2**32 (> 4G entries wraps it);
+            # a shorter-than-declared file is cut to its whole entries
+            if n & 0xFFFFFFFF != count:
+                n = min(n, count)
+            buf = b""
+            if n:
+                self._mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                buf = self._mm
+        self.entries = _Entries(buf, n, _IDX_ENTRY.unpack_from)
+        self._ts = _Entries(buf, n, lambda b, o: _IDX_TS.unpack_from(b, o)[0])
+
+    def close(self) -> None:
+        if self._mm is not None:
+            self._mm.close()
+            self._mm = None
 
     def verify_matches(self, tmns_path: str) -> None:
         """Confirm this index corresponds to tmns_path; raise ValueError if not.
@@ -274,14 +358,13 @@ class Index:
         Checks the recorded .tmns size and that the first index entry points at
         a real message in the file with the matching timestamp/length.
         """
-        import os
         actual = os.path.getsize(tmns_path)
         if self.tmns_size and self.tmns_size != actual:
             raise ValueError(
                 f"{self.path} does not correspond to {tmns_path}: index expects "
                 f"a {self.tmns_size}-byte file but it is {actual} bytes "
                 f"(stale/mismatched index)")
-        if not self.entries:
+        if not len(self.entries):
             return
         ts0, off0, _mdid0, len0 = self.entries[0]
         if off0 + DATAMSG_HEADER_LEN > actual:
@@ -299,17 +382,41 @@ class Index:
 
     @property
     def start_ts(self) -> int:
-        return self.entries[0][0] if self.entries else 0
+        return self.entries[0][0] if len(self.entries) else 0
 
     @property
     def end_ts(self) -> int:
-        return self.entries[-1][0] if self.entries else 0
+        return self.entries[-1][0] if len(self.entries) else 0
 
     @property
     def mdids(self) -> set:
-        return {e[2] for e in self.entries}
+        """Every MDID in the index (one pass over the whole file)."""
+        n = len(self.entries)
+        if not n:
+            return set()
+        try:
+            import numpy as np
+        except ImportError:
+            np = None
+        out = set()
+        step = 1 << 20                   # entries per pass
+        for i in range(0, n, step):
+            lo = IDX_HEADER_LEN + i * IDX_ENTRY_LEN
+            hi = lo + min(step, n - i) * IDX_ENTRY_LEN
+            part = self._mm[lo:hi]
+            if np is not None:
+                rec = np.frombuffer(part, dtype=">u4").reshape(-1, 6)
+                out.update(np.unique(rec[:, 4]).tolist())
+            else:
+                out.update(m for (m,) in struct.iter_unpack(">16xI4x", part))
+        return out
 
     def offset_at_or_after(self, ts: int) -> Optional[int]:
         """File offset of the first message with timestamp >= ts (or None)."""
         i = bisect.bisect_left(self._ts, ts)
+        return self.entries[i][1] if i < len(self.entries) else None
+
+    def offset_after(self, ts: int) -> Optional[int]:
+        """File offset of the first message with timestamp > ts (or None)."""
+        i = bisect.bisect_right(self._ts, ts)
         return self.entries[i][1] if i < len(self.entries) else None

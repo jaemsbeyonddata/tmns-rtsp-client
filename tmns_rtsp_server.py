@@ -37,6 +37,7 @@ Usage:
 """
 
 import argparse
+import bisect
 import glob
 import os
 import re
@@ -87,22 +88,34 @@ class Recording:
     def end_ts(self):
         return self.index.end_ts
 
+    def byte_range(self, start_ts, end_ts):
+        """(first offset, end offset, message count) for a time range, or None.
+
+        The recording is time-ordered, so the range is one contiguous run of
+        bytes, found by two binary searches of the index.
+        """
+        idx = self.index
+        if not len(idx) or self.end_ts < start_ts or self.start_ts > end_ts:
+            return None
+        lo = bisect.bisect_left(idx._ts, start_ts)
+        hi = bisect.bisect_right(idx._ts, end_ts)
+        if lo >= hi:
+            return None
+        end = idx.entries[hi][1] if hi < len(idx) else os.path.getsize(self.tmns_path)
+        return idx.entries[lo][1], end, hi - lo
+
     def messages(self, start_ts, end_ts, mdids):
-        """Yield raw message bytes with start_ts <= timestamp <= end_ts."""
-        if not len(self.index) or self.end_ts < start_ts or self.start_ts > end_ts:
+        """Yield (timestamp, raw message) with start_ts <= timestamp <= end_ts.
+
+        raw is a memoryview into a large read buffer (see tm.iter_raw).
+        """
+        rng = self.byte_range(start_ts, end_ts)
+        if rng is None:
             return
-        off = self.index.offset_at_or_after(start_ts)
-        if off is None:
-            return
-        with open(self.tmns_path, "rb") as f:
-            for _pos, h, raw in tm.iter_messages(f, off):
-                ts = h["timestamp"]
-                if ts > end_ts:
-                    return
-                if ts < start_ts:
-                    continue
-                if mdid_requested(mdids, h["mdid"]):
-                    yield raw
+        with open(self.tmns_path, "rb", buffering=0) as f:
+            for ts, mdid, raw in tm.iter_raw(f, rng[0], rng[1]):
+                if start_ts <= ts <= end_ts and mdid_requested(mdids, mdid):
+                    yield ts, raw
 
 
 class Library:
@@ -128,6 +141,13 @@ class Library:
 
     def total_messages(self):
         return sum(len(r.index) for r in self.recordings)
+
+    def mdid_summary(self, limit=50_000_000):
+        """Sorted MDIDs, unless the index is too big to scan at start-up."""
+        n = self.total_messages()
+        if n > limit:
+            return f"(not scanned: {n:,} index entries)"
+        return str(sorted(self.mdids))
 
     def messages(self, start_ts, end_ts, mdids):
         for r in self.recordings:               # already time-ordered
@@ -200,7 +220,7 @@ class TmnsRtspServer:
         srv.listen(5)
         print(f"[server] TmNS RTSPDataSource on TCP :{self.port}")
         print(f"[server] {len(self.lib.recordings)} recording(s), "
-              f"{self.lib.total_messages()} messages, MDIDs {sorted(self.lib.mdids)}")
+              f"{self.lib.total_messages():,} messages, MDIDs {self.lib.mdid_summary()}")
         print(f"[server] time span (PTP s): {tm.ts_to_seconds(self.lib.start_ts):.3f}"
               f" .. {tm.ts_to_seconds(self.lib.end_ts):.3f}")
         try:
@@ -399,6 +419,12 @@ class TmnsRtspServer:
         self._reply(conn, cseq, 501, "Not Implemented")
         return sess
 
+    SEND_CHUNK = 8 << 20        # sendfile() bytes between pause/stop checks
+    TCP_BATCH = 256 << 10       # coalesced TCP bytes per send
+    BATCH_AGE = 0.005           # seconds a paced TCP batch may wait to fill
+    MAX_GAP = 2.0               # longest wait for a timestamp gap (seconds)
+    SNDBUF = 8 << 20            # requested data-socket send buffer
+
     def _start_stream(self, sess, addr):
         if sess.thread and sess.thread.is_alive():
             sess.streaming.set()             # resume
@@ -407,43 +433,43 @@ class TmnsRtspServer:
         start_ts, end_ts = sess.range
 
         def run():
+            target = (sess.dest or addr[0], sess.client_port)
             if sess.lower == "UDP":
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                target = (sess.dest or addr[0], sess.client_port)
-                send = lambda b: sock.sendto(b, target)
             else:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.SNDBUF)
+            except OSError:
+                pass
+            if sess.lower != "UDP":
                 try:
-                    sock.connect((sess.dest or addr[0], sess.client_port))
+                    sock.connect(target)
                 except OSError as e:
                     print(f"[server] data connect failed: {e}")
+                    sock.close()
                     return
-                send = lambda b: sock.sendall(b)
-            print(f"[server] data {sess.lower} -> {sess.dest or addr[0]}:"
-                  f"{sess.client_port}  range {tm.ts_to_seconds(start_ts):.3f}.."
-                  f"{tm.ts_to_seconds(end_ts):.3f}")
+            print(f"[server] data {sess.lower} -> {target[0]}:{target[1]}  range "
+                  f"{tm.ts_to_seconds(start_ts):.3f}..{tm.ts_to_seconds(end_ts):.3f}")
 
             asap = self.asap or sess.speed <= 0
-            sent = 0
-            prev_ts = None
+            t0 = time.monotonic()
             try:
-                for raw in self.lib.messages(start_ts, end_ts, sess.mdids):
-                    while not sess.streaming.is_set() and not sess.stop.is_set():
-                        time.sleep(0.02)         # paused
-                    if sess.stop.is_set():
-                        break
-                    if not asap and prev_ts is not None:
-                        dt = (tm.ts_to_seconds(tm.parse_header(raw)["timestamp"])
-                              - tm.ts_to_seconds(prev_ts)) / sess.speed
-                        if dt > 0:
-                            time.sleep(min(dt, 2.0))   # cap to avoid long stalls
-                    send(raw)
-                    prev_ts = tm.parse_header(raw)["timestamp"]
-                    sent += 1
+                if sess.lower == "TCP" and asap and not sess.mdids:
+                    sent, nbytes, done = self._send_ranges(sess, sock, start_ts, end_ts)
                 else:
-                    if not sess.stop.is_set():
-                        send(tm.build_datamsg(0, 0, end_of_data=True))
-                        print(f"[server] End-of-Data after {sent} message(s)")
+                    sent, nbytes, done = self._send_messages(
+                        sess, sock, target, start_ts, end_ts, asap)
+                if done:
+                    eod = tm.build_datamsg(0, 0, end_of_data=True)
+                    if sess.lower == "UDP":
+                        sock.sendto(eod, target)
+                    else:
+                        sock.sendall(eod)
+                    dt = time.monotonic() - t0
+                    print(f"[server] End-of-Data after {sent:,} message(s), "
+                          f"{nbytes / 1e6:,.1f} MB in {dt:.1f}s "
+                          f"({nbytes / 1e6 / dt if dt > 0 else 0:,.1f} MB/s)")
             except OSError as e:
                 print(f"[server] data send stopped: {e}")
             finally:
@@ -451,6 +477,90 @@ class TmnsRtspServer:
 
         sess.thread = threading.Thread(target=run, daemon=True)
         sess.thread.start()
+
+    @staticmethod
+    def _wait_playing(sess):
+        """Block while paused; False once the session is stopped."""
+        while not sess.streaming.wait(0.05):
+            if sess.stop.is_set():
+                return False
+        return not sess.stop.is_set()
+
+    def _send_ranges(self, sess, sock, start_ts, end_ts):
+        """Unfiltered TCP as fast as possible: copy file bytes straight to the
+        socket with sendfile() (no per-message work in Python)."""
+        sent = nbytes = 0
+        for rec in self.lib.recordings:
+            rng = rec.byte_range(start_ts, end_ts)
+            if rng is None:
+                continue
+            off, end, count = rng
+            with open(rec.tmns_path, "rb") as f:
+                while off < end:
+                    if not self._wait_playing(sess):
+                        return sent, nbytes, False
+                    n = sock.sendfile(f, off, min(self.SEND_CHUNK, end - off))
+                    if n == 0:
+                        raise OSError("sendfile sent nothing")
+                    off += n
+                    nbytes += n
+            sent += count
+        return sent, nbytes, True
+
+    def _send_messages(self, sess, sock, target, start_ts, end_ts, asap):
+        """Send message by message: UDP (one datagram each), MDID-filtered
+        TCP, or real-time pacing.  TCP writes are coalesced into batches."""
+        udp = sess.lower == "UDP"
+        speed = sess.speed if sess.speed > 0 else 1.0
+        sendto = sock.sendto
+        batch, size, batch_t = [], 0, 0.0
+        sent = nbytes = 0
+        base = None                          # (wall time, message time) anchor
+        mono, sleep = time.monotonic, time.sleep
+
+        def flush():
+            nonlocal batch, size
+            if batch:
+                sock.sendall(b"".join(batch))
+                batch, size = [], 0
+
+        for ts, raw in self.lib.messages(start_ts, end_ts, sess.mdids):
+            if not sess.streaming.is_set():
+                flush()
+                if not self._wait_playing(sess):
+                    return sent, nbytes, False
+                base = None                  # resume paced from here
+            if sess.stop.is_set():
+                return sent, nbytes, False
+            if not asap:
+                # a fixed schedule (not per-gap sleeps) so timing errors
+                # don't accumulate over hours of playback
+                t = (ts >> 32) + (ts & 0xFFFFFFFF) * 1e-9
+                now = mono()
+                if base is None:
+                    base = (now, t)
+                wait = base[0] + (t - base[1]) / speed - now
+                if wait > self.MAX_GAP:      # cap long gaps in the recording
+                    base = (base[0] - (wait - self.MAX_GAP), base[1])
+                    wait = self.MAX_GAP
+                if wait > 0.0005:
+                    flush()
+                    sleep(wait)
+                elif batch and now - batch_t > self.BATCH_AGE:
+                    flush()
+            if udp:
+                sendto(raw, target)
+            else:
+                if not batch:
+                    batch_t = mono() if not asap else 0.0
+                batch.append(raw)
+                size += len(raw)
+                if size >= self.TCP_BATCH:
+                    flush()
+            sent += 1
+            nbytes += len(raw)
+        flush()
+        return sent, nbytes, True
 
 
 # ----- recording discovery + CLI ------------------------------------------
