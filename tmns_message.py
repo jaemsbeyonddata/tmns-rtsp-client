@@ -68,9 +68,21 @@ from typing import BinaryIO, Iterator, List, Optional, Tuple
 # ----- Chapter 24 message constants ---------------------------------------
 DATAMSG_HEADER_LEN = 24
 STD_PKG_HEADER_LEN = 12
+# MessageFlags (Ch.24 24.2.1.5, bit 0 = lsb)
 FLAG_END_OF_DATA = 0x0001
+FLAG_HEALTH_ERROR = 0x0002        # DataSourceHealthFlag: 1 = DataSource error
+FLAG_TIME_NOT_LOCKED = 0x0004     # DataSourceTimeLockFlag: 1 = NOT locked to
+                                  # the IEEE 1588 master clock
+FLAG_SIMULATED = 0x0008           # DataSourceAcquiredDataFlag: 1 = simulated
+FLAG_FRAGMENT_MASK = 0x0030       # MessageFragmentationFlags (bits 5-4)
 FLAG_PLAYBACK = 0x0040
 FLAG_STANDARD_PKG_HEADER = 0x0080
+# the DataSource-specific flags a caller may set (and Ch.26 26.5.4 ORs
+# together when combining messages)
+DATASOURCE_FLAGS = FLAG_HEALTH_ERROR | FLAG_TIME_NOT_LOCKED | FLAG_SIMULATED
+# MessageType (Ch.24 24.2.1.4)
+MSGTYPE_DATA = 0                  # TmNSDataMessage
+MSGTYPE_APPENDIX_24A = 1          # TmNSDataMessage per Appendix 24-A (Ch.11)
 
 # ----- container constants ------------------------------------------------
 REC_MAGIC = b"TMNSREC\x01"
@@ -120,13 +132,17 @@ def build_package(pdid: int, measdata: bytes, status: int = 0,
 
 def build_datamsg(mdid: int, seq: int, packages=None, options: bytes = b"",
                   end_of_data: bool = False, playback: bool = False,
-                  ts: Optional[int] = None) -> bytes:
+                  ts: Optional[int] = None, flags: int = 0,
+                  mtype: int = MSGTYPE_DATA) -> bytes:
+    """One TmNSDataMessage.  flags adds DataSource-specific MessageFlags
+    (DATASOURCE_FLAGS); mtype is the MessageType."""
     version = 1
+    extra = flags & DATASOURCE_FLAGS
     if end_of_data:
         # empty End-of-Data indicator (Ch.26 26.4.2.2)
         word0 = (version << 28) | FLAG_END_OF_DATA
         return struct.pack(">IIIIQ", word0, 0, 0, DATAMSG_HEADER_LEN, 0)
-    flags = 0
+    flags = extra
     if playback:
         flags |= FLAG_PLAYBACK
     payload = b""
@@ -134,7 +150,7 @@ def build_datamsg(mdid: int, seq: int, packages=None, options: bytes = b"",
         flags |= FLAG_STANDARD_PKG_HEADER
         payload = b"".join(packages)
     owc = len(options) // 4
-    word0 = (version << 28) | (owc << 24) | (0 << 16) | (flags & 0xFFFF)
+    word0 = (version << 28) | (owc << 24) | ((mtype & 0xF) << 16) | (flags & 0xFFFF)
     length = DATAMSG_HEADER_LEN + len(options) + len(payload)
     if ts is None:
         ts = now_timestamp()
@@ -178,7 +194,8 @@ def split_packages(pdid: int, body: bytes, status: int = 0, time_delta: int = 0,
 
 def messages_from_packages(mdid: int, packages: List[bytes], seqs: dict, ts: int,
                            playback: bool = False,
-                           max_msg_bytes: int = 60000) -> List[bytes]:
+                           max_msg_bytes: int = 60000, flags: int = 0,
+                           mtype: int = MSGTYPE_DATA) -> List[bytes]:
     """Group Packages into TmNSDataMessages within max_msg_bytes.
 
     seqs is a {mdid: next_seq} dict maintaining a monotonic per-MDID
@@ -191,14 +208,16 @@ def messages_from_packages(mdid: int, packages: List[bytes], seqs: dict, ts: int
             seq = seqs.get(mdid, 0); seqs[mdid] = seq + 1
             out.append(build_datamsg(mdid, seq, packages=group,
                                      options=build_options(len(group)),
-                                     playback=playback, ts=ts))
+                                     playback=playback, ts=ts, flags=flags,
+                                     mtype=mtype))
             group, size = [], DATAMSG_HEADER_LEN + OPTIONS_LEN
         group.append(pkg); size += len(pkg)
     if group:
         seq = seqs.get(mdid, 0); seqs[mdid] = seq + 1
         out.append(build_datamsg(mdid, seq, packages=group,
                                  options=build_options(len(group)),
-                                 playback=playback, ts=ts))
+                                 playback=playback, ts=ts, flags=flags,
+                                 mtype=mtype))
     return out
 
 

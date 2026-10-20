@@ -42,12 +42,30 @@ word2: MessageDefinitionSequenceNumber(32)
 word3: MessageLength(32)          # whole message length in bytes, incl. header
 word4: MessageTimestamp(64)
 ```
-`MessageFlags` bit 0 = `EndOfDataFlag`, bit 6 = `PlaybackDataFlag`.
+`MessageType` is 0 for a TmNSDataMessage, or 1 for one built per Chapter 24
+Appendix 24-A (Chapter 11 data). `MessageFlags` (Ch.24 §24.2.1.5; bit 0 is
+the least significant bit, per Chapter 21 Appendix 21-B):
+
+| Bit(s) | Mask | Flag | Meaning when set |
+| --- | --- | --- | --- |
+| 15–8 | `0xFF00` | reserved | must be 0 on transmission |
+| 7 | `0x0080` | `StandardPackageHeaderFlag` | all Packages use the standard PackageHeader |
+| 6 | `0x0040` | `PlaybackDataFlag` | playback data (0 = live) |
+| 5–4 | `0x0030` | `MessageFragmentationFlags` | `01` first, `10` middle, `11` last fragment (`00` = complete) |
+| 3 | `0x0008` | `DataSourceAcquiredDataFlag` | **simulated** data (0 = acquired) |
+| 2 | `0x0004` | `DataSourceTimeLockFlag` | source time **NOT locked** to the IEEE 1588 master |
+| 1 | `0x0002` | `DataSourceHealthFlag` | **error** in the part of the source that made the message |
+| 0 | `0x0001` | `EndOfDataFlag` | End-of-Data message |
+
+A source that combines messages ORs the three DataSource flags of the
+originals (Ch.26 §26.5.4), so any lost lock, error or simulated input carries
+through.
 
 > Reference: RTSP = RFC 2326 (obsoleted by RFC 7826). TmNS = IRIG 106
 > Chapters 21–28.
 >
-> **Validated against RCC 106-24 (October 2024)** Chapters 24 and 26. The
+> **Validated against RCC 106-24 (October 2024)**, reading the TmNS chapters
+> 21–28 (Chapters 24 and 26 define everything on the wire here). The
 > RTSP control/data channel (Ch.26) — methods, Transport/Range headers, URI
 > syntax, port 55554, 457, End-of-Data — and the `TmNSMessageHeader` /
 > MessageFlags / standard `PackageHeader` (Ch.24) are byte-identical to the
@@ -487,7 +505,7 @@ python3 tmns_rtsp_server.py --tmns-dir recordings/ --order recorded
 ```
 
 The server implements the full control channel and **passes the conformance
-suite** (19 checks over UDP, 20 over TCP).
+suite** (20 checks over UDP, 21 over TCP).
 
 ### Large recordings (hundreds of GB)
 
@@ -577,6 +595,7 @@ as a TmNS Package using the **Chapter 24 Appendix 24-A** field mapping:
 | Data Type (8b) | bits 15..8 of **PDID** |
 | Data Type Version (8b) | bits 7..0 of **PDID** |
 | Packet Body | TmNS Package payload (MeasurementData) |
+| — | **MessageType 1** (TmNSDataMessage per Appendix 24-A) |
 
 ```bash
 # generate a small valid sample recording (or use your own .ch10)
@@ -634,15 +653,55 @@ nanoseconds); files using other Chapter 11 time formats fall back to the RTC.
 With `--decode`, each received `TmNSDataMessage` is broken down:
 
 ```
-  msg mdid=7 seq=0 len=68 v=1 flags=0x0080 (live) ts=1785812738452373504
+  msg mdid=7 seq=0 len=68 v=1 flags=0x0084 (live, std-pkg, TIME NOT LOCKED) ts=1785812738.452373504
     options: PackageCount=1
     package[0] pdid=42 len=36 status=0x00 time_delta=0ns measdata=24B
 ```
 
-`flags=0x0080` is the `StandardPackageHeaderFlag`; bit 6 = `PlaybackDataFlag`,
-bit 0 = `EndOfDataFlag`. Add `--hexdump` to also dump the MeasurementData
-bytes, and `--decode-limit N` to cap how many messages are printed (`0` =
-unlimited).
+The flags are spelled out (see the `MessageFlags` table above); a message
+whose source is not time-locked or reports an error is shown in yellow, and a
+MessageType other than 0 is named (`type=1 (TmNSDataMessage per Appendix
+24-A)`). Add `--hexdump` to also dump the MeasurementData bytes, and
+`--decode-limit N` to cap how many messages are printed (`0` = unlimited).
+
+### DataSource conditions (time lock, health, simulated)
+
+Every receive (`stream`, `method`, `test`, `interactive`) tracks the
+DataSource flags, with or without `--decode`:
+
+- **Time lock** is followed per MDID. When an MDID's messages start carrying
+  `DataSourceTimeLockFlag`, the client prints a line at once, and again when
+  lock returns (the first 20 such events per data channel; later ones are
+  counted only):
+
+  ```
+  ! MDID 1: source time NOT locked to the IEEE 1588 master (DataSourceTimeLockFlag, message ts 1792459955.288552999)
+  * MDID 1: time lock regained (message ts 1792459955.730776786)
+  ```
+
+- The running stats line adds `unlocked=N`, as do interactive `stats` and
+  `status`, and the PLAY summary reports:
+
+  ```
+    time lock     : 272 message(s) NOT locked to the IEEE 1588 master (3 loss event(s))
+    unlock by MDID: 1=272
+    simulated     : 762 message(s) of simulated data (DataSourceAcquiredDataFlag)
+  ```
+
+  With no unlocked message it says `time lock : locked`. Messages with
+  `DataSourceHealthFlag` (source error), fragments, and non-zero reserved
+  header bits are counted on their own lines when present.
+- The conformance suite fails a source that sets Chapter 24 reserved header
+  bits. Losing lock, an error or simulated data are conditions of the source,
+  not protocol faults, so they are reported, not failed.
+
+To try it, the mock can simulate them: `--unlock-cycle L,U` reports the source
+time NOT locked for U seconds after every L locked seconds, and `--simulated`
+marks its data as simulated:
+
+```bash
+python3 tmns_mock_server.py --port 55554 --rate 200 --unlock-cycle 10,2
+```
 
 ## License
 

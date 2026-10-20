@@ -39,7 +39,12 @@ of RCC/IRIG 106 Chapter 26 to be useful:
         recording and streams each packet body as a TmNS Package, mapping the
         Chapter 11 fields into TmNS per Chapter 24 Appendix 24-A (Channel ID ->
         MDID low 16 bits, Data Type/Version -> PDID).  End-of-Data is sent when
-        the file is exhausted.
+        the file is exhausted.  These messages carry MessageType 1
+        (TmNSDataMessage per Appendix 24-A).
+  * DataSource conditions in MessageFlags (Ch.24 24.2.1.5) can be simulated:
+    --unlock-cycle L,U reports the source time NOT locked to the IEEE 1588
+    master for U seconds after every L locked seconds; --simulated marks the
+    data as simulated (DataSourceAcquiredDataFlag).
 
 Usage:
     python3 tmns_mock_server.py [--port 55554] [--mdid 1] [--pdid 100]
@@ -126,15 +131,20 @@ def build_package(pdid: int, measdata: bytes, status: int = 0,
     return pkg + b"\x00" * ((-len(pkg)) % 4)
 
 
+FLAG_TIME_NOT_LOCKED = 0x0004   # DataSourceTimeLockFlag (Ch.24 24.2.1.5)
+FLAG_SIMULATED = 0x0008         # DataSourceAcquiredDataFlag: simulated data
+
+
 def build_datamsg(mdid: int, seq: int, packages=None, options: bytes = b"",
                   end_of_data: bool = False, playback: bool = False,
-                  ts: int = None) -> bytes:
+                  ts: int = None, flags: int = 0, mtype: int = 0) -> bytes:
+    """flags adds DataSource-specific MessageFlags; mtype is MessageType."""
     version = 1
     if end_of_data:
         # empty End-of-Data indicator (Ch.26 26.4.2.2)
         word0 = (version << 28) | 0x0001
         return struct.pack(">IIIIQ", word0, 0, 0, DATAMSG_HEADER_LEN, 0)
-    flags = 0
+    flags &= 0x000E                  # DataSource health/time-lock/simulated
     if playback:
         flags |= 0x0040
     payload = b""
@@ -142,7 +152,7 @@ def build_datamsg(mdid: int, seq: int, packages=None, options: bytes = b"",
         flags |= 0x0080          # StandardPackageHeaderFlag
         payload = b"".join(packages)
     owc = len(options) // 4
-    word0 = (version << 28) | (owc << 24) | (0 << 16) | (flags & 0xFFFF)
+    word0 = (version << 28) | (owc << 24) | ((mtype & 0xF) << 16) | (flags & 0xFFFF)
     length = DATAMSG_HEADER_LEN + len(options) + len(payload)
     if ts is None:
         ts = now_timestamp()
@@ -169,7 +179,8 @@ class MockSource:
     def __init__(self, port, mdid, pdid, rate, session_timeout,
                  ch10_path=None, mdid_upper=0, loop=False,
                  max_msg_bytes=DEFAULT_MAX_MSG_BYTES, no_get_parameter=False,
-                 gp_405=False, max_sessions=0):
+                 gp_405=False, max_sessions=0, unlock_cycle=None,
+                 simulated=False):
         self.port = port
         self.mdid = mdid
         self.pdid = pdid
@@ -182,6 +193,9 @@ class MockSource:
         self.mdid_upper = mdid_upper
         self.loop = loop
         self.max_sessions = max_sessions      # 0 = unlimited
+        self.unlock_cycle = unlock_cycle      # (locked s, unlocked s) or None
+        self.simulated = simulated
+        self._t0 = time.monotonic()
         self.sessions = {}
         self._lock = threading.Lock()         # session count + id allocation
         self._sid_counter = 0x1000
@@ -472,6 +486,16 @@ class MockSource:
         sess.thread = threading.Thread(target=run, daemon=True)
         sess.thread.start()
 
+    def _source_flags(self):
+        """DataSource-specific MessageFlags for a message sent now."""
+        flags = FLAG_SIMULATED if self.simulated else 0
+        if self.unlock_cycle:
+            locked, unlocked = self.unlock_cycle
+            phase = (time.monotonic() - self._t0) % (locked + unlocked)
+            if phase >= locked:
+                flags |= FLAG_TIME_NOT_LOCKED
+        return flags
+
     def _synthetic_messages(self, sess):
         """Yield synthetic TmNSDataMessages (two Packages each).
 
@@ -488,7 +512,8 @@ class MockSource:
             pkgs = [build_package(self.pdid, m0, time_delta=seq * 1000),
                     build_package(self.pdid + 1, m1, time_delta=seq * 1000)]
             yield build_datamsg(self.mdid, seq, packages=pkgs,
-                                options=build_options(len(pkgs)))
+                                options=build_options(len(pkgs)),
+                                flags=self._source_flags())
             seq += 1
             if sess.bounded and seq >= 25:
                 # bounded Range: stream ends; run() emits the End-of-Data marker
@@ -523,14 +548,16 @@ class MockSource:
                 seq = seqs.get(mdid, 0); seqs[mdid] = seq + 1
                 yield build_datamsg(mdid, seq, packages=group,
                                     options=build_options(len(group)),
-                                    playback=True, ts=ts)
+                                    playback=True, ts=ts,
+                                    flags=self._source_flags(), mtype=1)
                 group, size = [], DATAMSG_HEADER_LEN + OPTIONS_LEN
             group.append(pkg); size += len(pkg)
         if group:
             seq = seqs.get(mdid, 0); seqs[mdid] = seq + 1
             yield build_datamsg(mdid, seq, packages=group,
                                 options=build_options(len(group)),
-                                playback=True, ts=ts)
+                                playback=True, ts=ts,
+                                flags=self._source_flags(), mtype=1)
 
     def _ch10_messages(self, sess):
         """Yield TmNSDataMessages built from a Chapter 11 recording.
@@ -557,6 +584,17 @@ class MockSource:
             if not self.loop:
                 return
             # loop: replay the file until stopped (no End-of-Data between loops)
+
+
+def parse_cycle(text):
+    """'L,U' -> (locked seconds, unlocked seconds), both > 0."""
+    try:
+        locked, unlocked = (float(v) for v in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected L,U seconds, got {text!r}")
+    if locked <= 0 or unlocked <= 0:
+        raise argparse.ArgumentTypeError("L and U must both be > 0")
+    return locked, unlocked
 
 
 def main():
@@ -591,13 +629,20 @@ def main():
     ap.add_argument("--gp-405", action="store_true",
                     help="reject GET_PARAMETER with 405 and an empty CSeq echo "
                          "(reproduces the keep-alive CSeq-mismatch case)")
+    ap.add_argument("--unlock-cycle", metavar="L,U", type=parse_cycle,
+                    help="simulate losing IEEE 1588 time lock: after every L "
+                         "locked seconds, set DataSourceTimeLockFlag (not "
+                         "locked) for U seconds, e.g. 10,2")
+    ap.add_argument("--simulated", action="store_true",
+                    help="mark data as simulated (DataSourceAcquiredDataFlag)")
     args = ap.parse_args()
     MockSource(args.port, args.mdid, args.pdid, args.rate,
                args.session_timeout, ch10_path=args.ch10,
                mdid_upper=args.mdid_upper, loop=args.loop,
                max_msg_bytes=args.max_msg_bytes,
                no_get_parameter=args.no_get_parameter, gp_405=args.gp_405,
-               max_sessions=args.max_sessions).serve()
+               max_sessions=args.max_sessions, unlock_cycle=args.unlock_cycle,
+               simulated=args.simulated).serve()
 
 
 if __name__ == "__main__":

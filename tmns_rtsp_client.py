@@ -45,7 +45,12 @@ TmNSMessageHeader (big-endian) is:
     word3: MessageLength(32)                 (bytes, whole message incl header)
     word4-5: MessageTimestamp(64)
 
-MessageFlags bit 0 = EndOfDataFlag, bit 6 = PlaybackDataFlag.
+MessageFlags (Ch.24 24.2.1.5; bit 0 = lsb): bit 0 EndOfDataFlag,
+bit 1 DataSourceHealthFlag (1 = error), bit 2 DataSourceTimeLockFlag
+(1 = NOT locked to the IEEE 1588 master clock), bit 3
+DataSourceAcquiredDataFlag (1 = simulated data), bits 5-4
+MessageFragmentationFlags, bit 6 PlaybackDataFlag, bit 7
+StandardPackageHeaderFlag; bits 15-8 reserved (zero).
 
 This tool has no third-party dependencies (Python 3.7+ stdlib only) and runs
 on Linux.
@@ -64,7 +69,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 DEFAULT_PORT = 55554  # RCC 106 Ch.26: default RTSPControlChannel TCP port
 HISTORY_FILE = os.path.expanduser("~/.tmns_rtsp_history")
@@ -646,14 +651,33 @@ class DataMessage:
     length: int
     timestamp: int
     payload_len: int
+    reserved: int = 0    # word0 Reserved field (bits 23-20), zero per Ch.24
 
     @property
     def end_of_data(self) -> bool:
-        return bool(self.flags & 0x0001)
+        return bool(self.flags & FLAG_END_OF_DATA)
 
     @property
     def playback(self) -> bool:
-        return bool(self.flags & 0x0040)
+        return bool(self.flags & FLAG_PLAYBACK)
+
+    @property
+    def time_locked(self) -> bool:
+        """DataSourceTimeLockFlag clear: locked to the IEEE 1588 master."""
+        return not self.flags & FLAG_TIME_NOT_LOCKED
+
+    @property
+    def health_error(self) -> bool:
+        return bool(self.flags & FLAG_HEALTH_ERROR)
+
+    @property
+    def simulated(self) -> bool:
+        return bool(self.flags & FLAG_SIMULATED)
+
+    @property
+    def fragment(self) -> int:
+        """MessageFragmentationFlags: 0 complete, 1 first, 2 middle, 3 last."""
+        return (self.flags & FLAG_FRAGMENT_MASK) >> 4
 
 
 def parse_datamsg_header(buf: bytes) -> Optional[DataMessage]:
@@ -665,13 +689,45 @@ def parse_datamsg_header(buf: bytes) -> Optional[DataMessage]:
     mtype = (word0 >> 16) & 0xF
     flags = word0 & 0xFFFF
     return DataMessage(version, owc, mtype, flags, mdid, seq, length, ts,
-                       max(0, length - DATAMSG_HEADER_LEN))
+                       max(0, length - DATAMSG_HEADER_LEN), (word0 >> 20) & 0xF)
 
 
 # MessageFlags bit masks (Ch.24 24.2.1.5)
 FLAG_END_OF_DATA = 0x0001
+FLAG_HEALTH_ERROR = 0x0002       # DataSourceHealthFlag: 1 = DataSource error
+FLAG_TIME_NOT_LOCKED = 0x0004    # DataSourceTimeLockFlag: 1 = NOT time-locked
+FLAG_SIMULATED = 0x0008          # DataSourceAcquiredDataFlag: 1 = simulated
+FLAG_FRAGMENT_MASK = 0x0030      # MessageFragmentationFlags (bits 5-4)
 FLAG_PLAYBACK = 0x0040
 FLAG_STANDARD_PKG_HEADER = 0x0080
+FLAG_RESERVED_MASK = 0xFF00      # bits 15-8: zero on transmission
+WORD0_RESERVED_MASK = 0x00F00000  # word0 Reserved field (bits 23-20)
+# word0 bits that need the slower accounting path (DataSource conditions,
+# fragments, and reserved bits a conforming source leaves zero)
+_WORD0_NOTABLE = (WORD0_RESERVED_MASK | FLAG_RESERVED_MASK | FLAG_FRAGMENT_MASK
+                  | FLAG_SIMULATED | FLAG_TIME_NOT_LOCKED | FLAG_HEALTH_ERROR)
+
+MESSAGE_TYPES = {0: "TmNSDataMessage", 1: "TmNSDataMessage per Appendix 24-A"}
+FRAGMENT_NAMES = {1: "first fragment", 2: "middle fragment", 3: "last fragment"}
+
+
+def describe_flags(flags: int) -> str:
+    """MessageFlags as words, e.g. 'playback, std-pkg, TIME NOT LOCKED'."""
+    words = ["playback" if flags & FLAG_PLAYBACK else "live"]
+    if flags & FLAG_STANDARD_PKG_HEADER:
+        words.append("std-pkg")
+    frag = (flags & FLAG_FRAGMENT_MASK) >> 4
+    if frag:
+        words.append(FRAGMENT_NAMES[frag])
+    if flags & FLAG_SIMULATED:
+        words.append("SIMULATED")
+    if flags & FLAG_TIME_NOT_LOCKED:
+        words.append("TIME NOT LOCKED")
+    if flags & FLAG_HEALTH_ERROR:
+        words.append("HEALTH ERROR")
+    if flags & FLAG_RESERVED_MASK:
+        words.append(f"reserved bits 0x{flags & FLAG_RESERVED_MASK:04x}")
+    return ", ".join(words)
 
 STANDARD_PKG_HEADER_LEN = 12  # Ch.24 24.2.2.1.1
 
@@ -815,15 +871,18 @@ def _hexdump(data: bytes, limit: int = 64, indent: str = "        ") -> List[str
 def print_decoded(dm: DecodedMessage, hexdump: bool = False) -> None:
     h = dm.header
     tag = " [END-OF-DATA]" if h.end_of_data else ""
-    pb = "playback" if h.playback else "live"
     trunc = " [TRUNCATED]" if dm.truncated else ""
+    mtype = "" if h.msg_type == 0 else \
+        f" type={h.msg_type} ({MESSAGE_TYPES.get(h.msg_type, 'unknown')})"
     # MessageTimestamp is the lower 64 bits of the IEEE-1588 structure:
     # upper 32 bits = seconds, lower 32 = nanoseconds (Ch.24 24.2.1.9).
     ts_sec = h.timestamp >> 32
     ts_nsec = h.timestamp & 0xFFFFFFFF
-    cprint(f"  msg mdid={h.mdid} seq={h.seq} len={h.length} v={h.version} "
-           f"flags=0x{h.flags:04x} ({pb}) ts={ts_sec}.{ts_nsec:09d}"
-           f"{tag}{trunc}", C.MAGENTA)
+    cprint(f"  msg mdid={h.mdid} seq={h.seq} len={h.length} v={h.version}{mtype} "
+           f"flags=0x{h.flags:04x} ({describe_flags(h.flags)}) "
+           f"ts={ts_sec}.{ts_nsec:09d}{tag}{trunc}",
+           C.YELLOW if h.flags & (FLAG_TIME_NOT_LOCKED | FLAG_HEALTH_ERROR)
+           else C.MAGENTA)
     if dm.options:
         cprint("    options: " + ", ".join(o.describe() for o in dm.options), C.DIM)
     if h.end_of_data:
@@ -863,6 +922,17 @@ class DataStats:
     by_pdid: Dict[int, int] = field(default_factory=dict)
     by_mdid_gaps: Dict[int, int] = field(default_factory=dict)   # gaps per MDID
     by_mdid_lost: Dict[int, int] = field(default_factory=dict)   # lost per MDID
+    # DataSource conditions reported in MessageFlags (Ch.24 24.2.1.5)
+    unlocked: int = 0                # messages with DataSourceTimeLockFlag set
+    lock_lost: int = 0               # locked -> not-locked changes, per MDID
+    health_errors: int = 0           # messages with DataSourceHealthFlag set
+    simulated: int = 0               # DataSourceAcquiredDataFlag = simulated
+    fragments: int = 0               # MessageFragmentationFlags != complete
+    reserved_set: int = 0            # Ch.24 reserved header bits not zero
+    by_mdid_unlocked: Dict[int, int] = field(default_factory=dict)
+    # called as (mdid, locked, timestamp) when an MDID loses/regains time lock
+    on_lock_event: Optional[Callable[[int, bool, int], None]] = None
+    _unlocked_now: Set[int] = field(default_factory=set)
     # per-MDID last sequence number (MessageDefinitionSequenceNumber is
     # assigned per-MDID, RCC 106 Ch.26 26.5.1)
     _last_seq: Dict[int, int] = field(default_factory=dict)
@@ -875,6 +945,10 @@ class DataStats:
         self.packages += len(dm.packages)
         for pkg in dm.packages:
             self.by_pdid[pkg.pdid] = self.by_pdid.get(pkg.pdid, 0) + 1
+        word0 = (m.reserved << 20) | m.flags
+        if not m.end_of_data and (word0 & _WORD0_NOTABLE
+                                  or m.mdid in self._unlocked_now):
+            self._note_flags(word0, m.mdid, m.timestamp)
         self._note_seq(m.mdid, m.seq, m.end_of_data, m.timestamp)
 
     def note_raw(self, buf: bytes, off: int = 0, end: Optional[int] = None) -> bool:
@@ -904,6 +978,8 @@ class DataStats:
                 n += 1
                 p = off + ((p - off + plen + 3) & ~3)   # 32-bit padding
             self.packages += n
+        if not eod and (word0 & _WORD0_NOTABLE or mdid in self._unlocked_now):
+            self._note_flags(word0, mdid, ts)
         self._note_seq(mdid, seq, eod, ts)
         return eod
 
@@ -916,6 +992,7 @@ class DataStats:
         """
         unpack, pkg_unpack = _MSG_HDR.unpack_from, _PKG_HDR.unpack_from
         by_mdid, by_pdid, last = self.by_mdid, self.by_pdid, self._last_seq
+        unlocked_now, notable = self._unlocked_now, _WORD0_NOTABLE
         msgs = nbytes = pkgs = 0
         while n - off >= DATAMSG_HEADER_LEN:
             word0, mdid, seq, length, ts = unpack(buf, off)
@@ -941,6 +1018,8 @@ class DataStats:
                     by_pdid[pdid] = by_pdid.get(pdid, 0) + 1
                     pkgs += 1
                     p = off + ((p - off + plen + 3) & ~3)   # 32-bit padding
+            if word0 & notable or (unlocked_now and mdid in unlocked_now):
+                self._note_flags(word0, mdid, ts)
             prev = last.get(mdid)
             if prev is not None and seq != (prev + 1) & 0xFFFFFFFF:
                 self._seq_anomaly(mdid, prev, seq, ts)
@@ -950,6 +1029,33 @@ class DataStats:
         self.bytes += nbytes
         self.packages += pkgs
         return off
+
+    def _note_flags(self, word0: int, mdid: int, ts: int) -> None:
+        """Count DataSource conditions and header anomalies in word0.
+
+        Time lock is tracked per MDID, so a source that loses and regains
+        lock is reported as an event each time, not once per message.
+        """
+        if word0 & FLAG_TIME_NOT_LOCKED:
+            self.unlocked += 1
+            self.by_mdid_unlocked[mdid] = self.by_mdid_unlocked.get(mdid, 0) + 1
+            if mdid not in self._unlocked_now:
+                self._unlocked_now.add(mdid)
+                self.lock_lost += 1
+                if self.on_lock_event is not None:
+                    self.on_lock_event(mdid, False, ts)
+        elif mdid in self._unlocked_now:
+            self._unlocked_now.discard(mdid)
+            if self.on_lock_event is not None:
+                self.on_lock_event(mdid, True, ts)
+        if word0 & FLAG_HEALTH_ERROR:
+            self.health_errors += 1
+        if word0 & FLAG_SIMULATED:
+            self.simulated += 1
+        if word0 & FLAG_FRAGMENT_MASK:
+            self.fragments += 1
+        if word0 & (WORD0_RESERVED_MASK | FLAG_RESERVED_MASK):
+            self.reserved_set += 1
 
     def _note_seq(self, mdid: int, seq: int, end_of_data: bool, ts: int) -> None:
         # The empty End-of-Data indicator carries mdid=0/seq=0 and is not part
@@ -984,6 +1090,12 @@ def kdrops_field(stats: DataStats, sep: str = "") -> str:
     return "" if stats.kernel_drops is None else f" kdrops={stats.kernel_drops}{sep}"
 
 
+def unlocked_field(stats: DataStats, sep: str = "") -> str:
+    """' unlocked=N<sep>' (messages not time-locked) for one-line totals, or
+    '' when every message so far was locked."""
+    return f" unlocked={stats.unlocked:,}{sep}" if stats.unlocked else ""
+
+
 def print_play_summary(stats: DataStats, title: str = "PLAY summary") -> None:
     """Print the final statistics of a completed (or interrupted) PLAY."""
     el = stats.elapsed or 0.0
@@ -1010,6 +1122,26 @@ def print_play_summary(stats: DataStats, title: str = "PLAY summary") -> None:
         cprint(f"  gaps by MDID  : {breakdown}", C.YELLOW)
     if stats.dupes:
         cprint(f"  duplicates/reorders : {stats.dupes}", C.YELLOW)
+    if stats.unlocked:
+        cprint(f"  time lock     : {stats.unlocked:,} message(s) NOT locked to the "
+               f"IEEE 1588 master ({stats.lock_lost} loss event(s))", C.YELLOW)
+        cprint("  unlock by MDID: " + ", ".join(
+            f"{m}={stats.by_mdid_unlocked[m]:,}"
+            for m in sorted(stats.by_mdid_unlocked)), C.YELLOW)
+    elif stats.messages > (1 if stats.end_of_data else 0):
+        cprint("  time lock     : locked (no message had DataSourceTimeLockFlag set)")
+    if stats.health_errors:
+        cprint(f"  source health : {stats.health_errors:,} message(s) with "
+               f"DataSourceHealthFlag set (error)", C.RED)
+    if stats.simulated:
+        cprint(f"  simulated     : {stats.simulated:,} message(s) of simulated "
+               f"data (DataSourceAcquiredDataFlag)", C.YELLOW)
+    if stats.fragments:
+        cprint(f"  fragments     : {stats.fragments:,} message fragment(s) "
+               f"(MessageFragmentationFlags)")
+    if stats.reserved_set:
+        cprint(f"  reserved bits : {stats.reserved_set:,} message(s) with Ch.24 "
+               f"reserved header bits set (non-conforming)", C.YELLOW)
     if stats.kernel_drops is not None:
         hint = ("  (receive buffer overflow on this host; raise --rcvbuf "
                 "and net.core.rmem_max)" if stats.kernel_drops else "")
@@ -1064,6 +1196,7 @@ class DataChannel:
         self._streambuf = bytearray(self.TCP_BUF)
         self._streamlen = 0
         self._udpbuf = bytearray(65536)  # one datagram at a time (UDP)
+        self._lock_events = 0            # time-lock events seen (for the cap)
         # SO_RXQ_OVFL: the kernel stamps each datagram with the socket's
         # cumulative drop count; None when unsupported on this platform
         self._rxq_ovfl = False
@@ -1182,6 +1315,8 @@ class DataChannel:
         """
         if stats is None:
             stats = DataStats()
+        if stats.on_lock_event is None:
+            stats.on_lock_event = self._lock_event
         if self.lower == "UDP" and self._rxq_ovfl:
             # the counter is cumulative per socket; report drops since now
             self._drops_base = self._rxq_drops
@@ -1276,7 +1411,8 @@ class DataChannel:
                f"({inst_rate:,.0f}/s) data={human_bytes(stats.bytes)} "
                f"({human_bytes(inst_bw)}/s) pkgs={stats.packages:,} "
                f"mdids={len(stats.by_mdid)} gaps={stats.gaps} "
-               f"lost={stats.lost}{kdrops_field(stats)}{eod}", C.BLUE)
+               f"lost={stats.lost}{kdrops_field(stats)}{unlocked_field(stats)}"
+               f"{eod}", C.BLUE)
 
     UDP_BATCH = 1024    # datagrams read per wake-up before re-checking deadlines
 
@@ -1387,9 +1523,27 @@ class DataChannel:
         elif self.verbose:
             m = dm.header
             tag = " [END-OF-DATA]" if m.end_of_data else ""
-            pb = "playback" if m.playback else "live"
             cprint(f"    data: mdid={m.mdid} seq={m.seq} len={m.length} "
-                   f"flags=0x{m.flags:04x} ({pb}){tag}", C.MAGENTA)
+                   f"flags=0x{m.flags:04x} ({describe_flags(m.flags)}){tag}",
+                   C.YELLOW if m.flags & (FLAG_TIME_NOT_LOCKED | FLAG_HEALTH_ERROR)
+                   else C.MAGENTA)
+
+    LOCK_EVENTS_SHOWN = 20   # time-lock lost/regained lines printed per channel
+
+    def _lock_event(self, mdid: int, locked: bool, ts: int) -> None:
+        """Report an MDID losing or regaining IEEE 1588 time lock."""
+        self._lock_events += 1
+        if self._lock_events > self.LOCK_EVENTS_SHOWN:
+            return
+        when = f"{ts >> 32}.{ts & 0xFFFFFFFF:09d}"
+        if locked:
+            cprint(f"* MDID {mdid}: time lock regained (message ts {when})", C.GREEN)
+        else:
+            cprint(f"! MDID {mdid}: source time NOT locked to the IEEE 1588 "
+                   f"master (DataSourceTimeLockFlag, message ts {when})", C.YELLOW)
+        if self._lock_events == self.LOCK_EVENTS_SHOWN:
+            cprint("    ... (further time-lock events are counted, not shown)",
+                   C.DIM)
 
     def _conn_stale(self) -> bool:
         """Drop a kept TCP data connection the source closed while idle.
@@ -1612,6 +1766,10 @@ class ConformanceTester:
                               f"mdids={sorted(stats.by_mdid)}")
                     self._add("No sequence gaps observed", stats.gaps == 0,
                               f"{stats.gaps} gap(s)")
+                    self._add("Message headers keep Ch.24 reserved bits zero",
+                              stats.reserved_set == 0,
+                              f"{stats.reserved_set} message(s) with reserved "
+                              f"bits set")
                     if data.lower == "TCP":
                         self._add("TCP data channel not dropped by the source",
                                   not stats.peer_closed,
@@ -2330,7 +2488,8 @@ def cmd_interactive(args) -> int:
         if s is not None:
             cprint(f"  received   : {s.messages:,} msgs, {human_bytes(s.bytes)}, "
                    f"{s.packages:,} pkgs, gaps={s.gaps}, lost={s.lost},"
-                   f"{kdrops_field(s, ',')} eod={s.end_of_data}"
+                   f"{kdrops_field(s, ',')}{unlocked_field(s, ',')} "
+                   f"eod={s.end_of_data}"
                    + (" (peer closed)" if s.peer_closed else ""), C.DIM)
         cprint(f"  CSeq       : {c.cseq}", C.DIM)
 
@@ -2506,8 +2665,8 @@ def cmd_interactive(args) -> int:
                 s = bg["stats"]
                 cprint(f"* {s.messages:,} msgs, {human_bytes(s.bytes)}, "
                        f"{s.packages:,} pkgs, mdids={compact_ranges(s.by_mdid)}, "
-                       f"gaps={s.gaps}, lost={s.lost},{kdrops_field(s, ',')} "
-                       f"eod={s.end_of_data}"
+                       f"gaps={s.gaps}, lost={s.lost},{kdrops_field(s, ',')}"
+                       f"{unlocked_field(s, ',')} eod={s.end_of_data}"
                        + (" (peer closed)" if s.peer_closed else ""), C.BOLD)
             else:
                 cprint("* not receiving (use 'play')", C.YELLOW)

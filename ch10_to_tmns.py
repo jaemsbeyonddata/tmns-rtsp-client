@@ -59,8 +59,10 @@ def convert(ch10_path, out_base, mdid_upper=0, max_msg_bytes=60000,
             ts, _absolute = chapter11.message_timestamp(pkt)
             pkgs = tm.split_packages(pdid, body, pkt.flags & 0xFF,
                                      pkt.rtc & 0xFFFFFFFF, max_msg_bytes)
-            for msg in tm.messages_from_packages(mdid, pkgs, seqs, ts,
-                                                 playback, max_msg_bytes):
+            # MessageType 1: TmNSDataMessage per Appendix 24-A (Ch.24 24.2.1.4)
+            for msg in tm.messages_from_packages(
+                    mdid, pkgs, seqs, ts, playback, max_msg_bytes,
+                    mtype=tm.MSGTYPE_APPENDIX_24A):
                 writer.write(msg)
                 messages += 1
             by_pdid[pdid] = by_pdid.get(pdid, 0) + 1
