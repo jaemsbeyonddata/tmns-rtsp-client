@@ -112,7 +112,8 @@ def main():
               f"{tm.ts_to_seconds(last):.3f}")
     if not writer.time_ordered:
         print("  note: message timestamps are not in time order; the index "
-              "marks it so playback reads in timestamp order")
+              "marks it, and the server plays it in timestamp order (or as "
+              "recorded with --order recorded)")
 
 
 if __name__ == "__main__":

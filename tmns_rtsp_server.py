@@ -93,30 +93,43 @@ class Recording:
     def time_ordered(self):
         return self.index.time_ordered
 
-    def byte_range(self, start_ts, end_ts):
-        """(first offset, end offset, message count) for a time range, or None.
+    def file_span(self, start_ts, end_ts):
+        """Bytes holding the messages of a time range, or None if it has none.
 
-        Only for a time-ordered recording, where the range is one contiguous
-        run of bytes, found by two binary searches of the index.
+        Returns (first offset, end offset, message count, exact); exact means
+        every message in the span is in the range, so the span can be sent
+        as-is.  A time-ordered recording's range is one contiguous run found
+        by two binary searches; otherwise the span runs from the lowest to
+        the highest offset of the range's entries.
         """
         idx = self.index
         if not len(idx) or self.end_ts < start_ts or self.start_ts > end_ts:
             return None
-        lo = bisect.bisect_left(idx._ts, start_ts)
-        hi = bisect.bisect_right(idx._ts, end_ts)
+        lo, hi = idx.span(start_ts, end_ts)
         if lo >= hi:
             return None
-        end = idx.entries[hi][1] if hi < len(idx) else os.path.getsize(self.tmns_path)
-        return idx.entries[lo][1], end, hi - lo
+        size = os.path.getsize(self.tmns_path)
+        if self.time_ordered:
+            end = idx.entries[hi][1] if hi < len(idx) else size
+            return idx.entries[lo][1], end, hi - lo, True
+        if lo == 0 and hi == len(idx):           # the whole recording
+            return tm.REC_HEADER_LEN, size, hi - lo, True
+        first, end = size, 0
+        for _ts, off, _mdid, length in idx.iter_entries(lo, hi):
+            first = min(first, off)
+            end = max(end, off + length)
+        return first, end, hi - lo, False
 
-    def messages(self, start_ts, end_ts, mdids):
+    def messages(self, start_ts, end_ts, mdids, order="timestamp"):
         """Yield (timestamp, raw message) with start_ts <= timestamp <= end_ts.
 
-        raw is a memoryview into a large read buffer (see tm.iter_raw).
+        order "timestamp" yields them in timestamp order; "recorded" in file
+        order (the same thing for a time-ordered recording).  raw is a
+        memoryview into a read buffer (see tm.iter_raw / tm.iter_indexed).
         """
         if not len(self.index) or self.end_ts < start_ts or self.start_ts > end_ts:
             return
-        if not self.time_ordered:
+        if not self.time_ordered and order == "timestamp":
             # read in index (timestamp) order; the index's MDIDs filter
             # before anything is read
             lo, hi = self.index.span(start_ts, end_ts)
@@ -126,30 +139,38 @@ class Recording:
                 for ts, _mdid, raw in tm.iter_indexed(f, entries):
                     yield ts, raw
             return
-        rng = self.byte_range(start_ts, end_ts)
-        if rng is None:
+        span = self.file_span(start_ts, end_ts)
+        if span is None:
             return
         with open(self.tmns_path, "rb", buffering=0) as f:
-            for ts, mdid, raw in tm.iter_raw(f, rng[0], rng[1]):
+            for ts, mdid, raw in tm.iter_raw(f, span[0], span[1]):
                 if start_ts <= ts <= end_ts and mdid_requested(mdids, mdid):
                     yield ts, raw
 
 
 class Library:
-    """One or more recordings, played back in time order.
+    """One or more recordings, played back by start time.
 
-    Recordings whose time spans overlap form a group whose messages are
-    merged by timestamp; groups play one after another.
+    order "timestamp": recordings whose time spans overlap form a group whose
+    messages are merged by timestamp; groups play one after another.
+    order "recorded": each recording plays whole, in file order, one after
+    another.
     """
 
-    def __init__(self, recordings):
+    ORDERS = ("timestamp", "recorded")
+
+    def __init__(self, recordings, order="timestamp"):
+        if order not in self.ORDERS:
+            raise ValueError(f"order must be one of {self.ORDERS}")
+        self.order = order
         self.recordings = sorted(recordings, key=lambda r: r.start_ts)
         self.groups = []
         group_end = None
         for r in self.recordings:
             if not len(r.index):
                 continue
-            if self.groups and r.start_ts <= group_end:
+            if (order == "timestamp" and self.groups
+                    and r.start_ts <= group_end):
                 self.groups[-1].append(r)
                 group_end = max(group_end, r.end_ts)
             else:
@@ -182,10 +203,10 @@ class Library:
         return str(sorted(self.mdids))
 
     def messages(self, start_ts, end_ts, mdids, groups=None):
-        """Yield (timestamp, raw message) in timestamp order."""
+        """Yield (timestamp, raw message) in the library's order."""
         for group in self.groups if groups is None else groups:
             if len(group) == 1:
-                yield from group[0].messages(start_ts, end_ts, mdids)
+                yield from group[0].messages(start_ts, end_ts, mdids, self.order)
             else:
                 yield from heapq.merge(
                     *(r.messages(start_ts, end_ts, mdids) for r in group),
@@ -262,10 +283,13 @@ class TmnsRtspServer:
         print(f"[server] time span (PTP s): {tm.ts_to_seconds(self.lib.start_ts):.3f}"
               f" .. {tm.ts_to_seconds(self.lib.end_ts):.3f}")
         # (an index without the order flag is checked here, not on PLAY)
+        print(f"[server] playback order: {self.lib.order}")
         for r in self.lib.recordings:
             if not r.time_ordered:
+                how = ("played as recorded" if self.lib.order == "recorded"
+                       else "read in index order")
                 print(f"[server] {os.path.basename(r.tmns_path)}: not in time "
-                      f"order; read in index order")
+                      f"order; {how}")
         merged = sum(len(g) for g in self.lib.groups if len(g) > 1)
         if merged:
             print(f"[server] {merged} recording(s) overlap in time; their "
@@ -535,14 +559,20 @@ class TmnsRtspServer:
         return not sess.stop.is_set()
 
     def _send_tcp_asap(self, sess, sock, start_ts, end_ts):
-        """Unfiltered TCP as fast as possible.  A time-ordered recording that
-        overlaps no other is copied straight to the socket with sendfile()
-        (no per-message work in Python); other groups are merged and sent
-        message by message."""
+        """Unfiltered TCP as fast as possible.  A recording whose span for the
+        Range holds only in-range messages, already in the order to send, is
+        copied straight to the socket with sendfile() (no per-message work
+        in Python); anything else is sent message by message."""
         sent = nbytes = 0
         for group in self.lib.groups:
             rec = group[0]
-            if len(group) > 1 or not rec.time_ordered:
+            span = None
+            if len(group) == 1:
+                span = rec.file_span(start_ts, end_ts)
+                if span is None:
+                    continue
+            if (span is None or not span[3] or
+                    (not rec.time_ordered and self.lib.order == "timestamp")):
                 n, b, done = self._send_messages(
                     sess, sock, None,
                     self.lib.messages(start_ts, end_ts, [], [group]), True)
@@ -550,10 +580,7 @@ class TmnsRtspServer:
                 if not done:
                     return sent, nbytes, False
                 continue
-            rng = rec.byte_range(start_ts, end_ts)
-            if rng is None:
-                continue
-            off, end, count = rng
+            off, end, count, _exact = span
             with open(rec.tmns_path, "rb") as f:
                 while off < end:
                     if not self._wait_playing(sess):
@@ -594,7 +621,9 @@ class TmnsRtspServer:
                 return sent, nbytes, False
             if not asap:
                 # a fixed schedule (not per-gap sleeps) so timing errors
-                # don't accumulate over hours of playback
+                # don't accumulate over hours of playback; a message behind
+                # the schedule (e.g. a timestamp going backwards with
+                # --order recorded) goes out at once
                 t = (ts >> 32) + (ts & 0xFFFFFFFF) * 1e-9
                 now = mono()
                 if base is None:
@@ -677,11 +706,17 @@ def main():
     ap.add_argument("--max-sessions", type=int, default=0,
                     help="most RTSP sessions open at once; a SETUP beyond it gets "
                          "503 Service Unavailable (default 0 = unlimited)")
+    ap.add_argument("--order", choices=Library.ORDERS, default="timestamp",
+                    help="message order for out-of-order or overlapping "
+                         "recordings: 'timestamp' (default) sends in "
+                         "timestamp order, merging overlapping recordings; "
+                         "'recorded' plays each file as recorded, in file "
+                         "order, one after another")
     ap.add_argument("--asap", action="store_true",
                     help="ignore timestamps and send as fast as possible")
     args = ap.parse_args()
 
-    library = Library(load_recordings(args))
+    library = Library(load_recordings(args), args.order)
     TmnsRtspServer(library, args.port, args.session_timeout,
                    args.speed, args.asap, args.max_sessions).serve()
 
