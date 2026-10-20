@@ -111,8 +111,8 @@ def main():
         print(f"  time span (PTP s): {tm.ts_to_seconds(first):.3f} .. "
               f"{tm.ts_to_seconds(last):.3f}")
     if not writer.time_ordered:
-        print("  warning: message timestamps are not in time order in the "
-              ".tmns; Range playback assumes they are")
+        print("  note: message timestamps are not in time order; the index "
+              "marks it so playback reads in timestamp order")
 
 
 if __name__ == "__main__":

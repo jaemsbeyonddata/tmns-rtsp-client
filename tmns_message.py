@@ -38,12 +38,17 @@ plus a time-ordered index for fast Range search during RTSP playback (Ch.26).
   .tmns:  16-byte header  magic b"TMNSREC\\x01" | version u16 | reserved(6)
           then a sequence of TmNSDataMessages, each framed by its MessageLength.
   .index: 24-byte header  magic b"TMNSIDX\\x01" | version u16 | entry_count u32
-                          | tmns_size u64 | reserved(2)
+                          | tmns_size u64 | flags u8 | reserved(1)
           then entry_count fixed 24-byte, time-ordered entries:
             MessageTimestamp u64 | file_offset u64 | MDID u32 | MessageLength u32
 
   entry_count holds the count modulo 2**32; a reader takes the real count
   from the .index size, so an index can hold more than 4G entries.
+
+  flags says whether the .tmns itself is in time order (its messages appear
+  in the same order as the index entries): IDX_FLAG_ORDERED or
+  IDX_FLAG_UNORDERED.  An index with neither (written before the flag
+  existed) is checked once when opened.
 
   tmns_size links the index to its .tmns file (the .tmns byte size at index
   time), so a stale/mismatched index can be detected — every .tmns has exactly
@@ -75,6 +80,8 @@ IDX_MAGIC = b"TMNSIDX\x01"
 IDX_VERSION = 1
 IDX_HEADER_LEN = 24
 IDX_ENTRY_LEN = 24
+IDX_FLAG_ORDERED = 0x01          # .tmns messages are in timestamp order
+IDX_FLAG_UNORDERED = 0x02        # .tmns messages are not in timestamp order
 
 
 # ----- timestamps ---------------------------------------------------------
@@ -263,8 +270,11 @@ class RecordWriter:
         self._tmp.close()
         try:
             with open(self.index_path, "wb") as out:
+                flags = (IDX_FLAG_ORDERED if self.time_ordered
+                         else IDX_FLAG_UNORDERED)
                 out.write(IDX_MAGIC + struct.pack(
-                    ">HIQ2x", IDX_VERSION, self.count & 0xFFFFFFFF, self.offset))
+                    ">HIQBx", IDX_VERSION, self.count & 0xFFFFFFFF,
+                    self.offset, flags))
                 if self.time_ordered:
                     with open(self._tmp.name, "rb") as src:
                         shutil.copyfileobj(src, out, 16 << 20)
@@ -341,9 +351,12 @@ def write_index(path: str, entries: List[Tuple[int, int, int, int]],
     """
     if any(entries[i][0] > entries[i + 1][0] for i in range(len(entries) - 1)):
         entries = sorted(entries, key=lambda e: e[0])
+    ordered = all(entries[i][1] < entries[i + 1][1]
+                  for i in range(len(entries) - 1))
     with open(path, "wb") as f:
-        f.write(IDX_MAGIC + struct.pack(">HIQ2x", IDX_VERSION,
-                                        len(entries) & 0xFFFFFFFF, tmns_size))
+        f.write(IDX_MAGIC + struct.pack(
+            ">HIQBx", IDX_VERSION, len(entries) & 0xFFFFFFFF, tmns_size,
+            IDX_FLAG_ORDERED if ordered else IDX_FLAG_UNORDERED))
         _write_entries(f, entries)
 
 
@@ -407,6 +420,40 @@ def iter_raw(f: BinaryIO, start_offset: int, end_offset: Optional[int] = None,
         pos += length
 
 
+def iter_indexed(f: BinaryIO, entries, chunk: int = READ_CHUNK
+                 ) -> Iterator[Tuple[int, int, memoryview]]:
+    """Yield (timestamp, mdid, message) in the order of index entries.
+
+    For a .tmns whose messages are not in time order: each message is read
+    at its indexed offset, but entries that sit back to back in the file are
+    fetched with one read (up to chunk bytes), so stretches that are in
+    order still read sequentially.
+    """
+    run: List[Tuple[int, int, int, int]] = []
+    start = end = 0
+
+    def fetch():
+        f.seek(start)
+        buf = memoryview(f.read(end - start))
+        for ts, off, mdid, length in run:
+            o = off - start
+            if o + length > len(buf):
+                return                   # file shorter than its index
+            yield ts, mdid, buf[o:o + length]
+
+    for e in entries:
+        off, length = e[1], e[3]
+        if run and (off != end or end - start + length > chunk):
+            yield from fetch()
+            run = []
+        if not run:
+            start = end = off
+        run.append(e)
+        end = off + length
+    if run:
+        yield from fetch()
+
+
 # ----- .index reader with time search -------------------------------------
 
 class _Entries:
@@ -444,7 +491,8 @@ class Index:
             hdr = f.read(IDX_HEADER_LEN)
             if len(hdr) < IDX_HEADER_LEN or hdr[:8] != IDX_MAGIC:
                 raise ValueError(f"{path}: not a TmNS .index file")
-            _ver, count, self.tmns_size = struct.unpack(">HIQ", hdr[8:22])
+            _ver, count, self.tmns_size, self.flags = struct.unpack(
+                ">HIQB", hdr[8:23])
             size = os.fstat(f.fileno()).st_size
             n = (size - IDX_HEADER_LEN) // IDX_ENTRY_LEN
             # entry_count is the count modulo 2**32 (> 4G entries wraps it);
@@ -457,6 +505,7 @@ class Index:
                 buf = self._mm
         self.entries = _Entries(buf, n, _IDX_ENTRY.unpack_from)
         self._ts = _Entries(buf, n, lambda b, o: _IDX_TS.unpack_from(b, o)[0])
+        self._ordered: Optional[bool] = None
 
     def close(self) -> None:
         if self._mm is not None:
@@ -521,6 +570,49 @@ class Index:
             else:
                 out.update(m for (m,) in struct.iter_unpack(">16xI4x", part))
         return out
+
+    @property
+    def time_ordered(self) -> bool:
+        """True if the .tmns holds its messages in timestamp order.
+
+        Taken from the header flag; an index without one is checked once
+        (file offsets must rise through the time-ordered entries).
+        """
+        if self._ordered is None:
+            if self.flags & IDX_FLAG_ORDERED:
+                self._ordered = True
+            elif self.flags & IDX_FLAG_UNORDERED:
+                self._ordered = False
+            else:
+                self._ordered = self._offsets_rise()
+        return self._ordered
+
+    def _offsets_rise(self) -> bool:
+        prev = -1
+        for i in range(0, len(self.entries), 1 << 20):
+            hi = min(i + (1 << 20), len(self.entries))
+            block = self._mm[IDX_HEADER_LEN + i * IDX_ENTRY_LEN:
+                             IDX_HEADER_LEN + hi * IDX_ENTRY_LEN]
+            offs = [o for (o,) in struct.iter_unpack(">8xQ8x", block)]
+            if offs[0] <= prev or any(a >= b for a, b in zip(offs, offs[1:])):
+                return False
+            prev = offs[-1]
+        return True
+
+    def span(self, start_ts: int, end_ts: int) -> Tuple[int, int]:
+        """Entry numbers [lo, hi) with start_ts <= timestamp <= end_ts."""
+        return (bisect.bisect_left(self._ts, start_ts),
+                bisect.bisect_right(self._ts, end_ts))
+
+    def iter_entries(self, lo: int, hi: int
+                     ) -> Iterator[Tuple[int, int, int, int]]:
+        """Yield (ts, offset, mdid, length) for entries lo..hi-1."""
+        step = 65536
+        for i in range(lo, hi, step):
+            j = min(i + step, hi)
+            yield from _IDX_ENTRY.iter_unpack(
+                self._mm[IDX_HEADER_LEN + i * IDX_ENTRY_LEN:
+                         IDX_HEADER_LEN + j * IDX_ENTRY_LEN])
 
     def offset_at_or_after(self, ts: int) -> Optional[int]:
         """File offset of the first message with timestamp >= ts (or None)."""

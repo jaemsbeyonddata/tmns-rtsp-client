@@ -39,6 +39,7 @@ Usage:
 import argparse
 import bisect
 import glob
+import heapq
 import os
 import re
 import socket
@@ -88,11 +89,15 @@ class Recording:
     def end_ts(self):
         return self.index.end_ts
 
+    @property
+    def time_ordered(self):
+        return self.index.time_ordered
+
     def byte_range(self, start_ts, end_ts):
         """(first offset, end offset, message count) for a time range, or None.
 
-        The recording is time-ordered, so the range is one contiguous run of
-        bytes, found by two binary searches of the index.
+        Only for a time-ordered recording, where the range is one contiguous
+        run of bytes, found by two binary searches of the index.
         """
         idx = self.index
         if not len(idx) or self.end_ts < start_ts or self.start_ts > end_ts:
@@ -109,6 +114,18 @@ class Recording:
 
         raw is a memoryview into a large read buffer (see tm.iter_raw).
         """
+        if not len(self.index) or self.end_ts < start_ts or self.start_ts > end_ts:
+            return
+        if not self.time_ordered:
+            # read in index (timestamp) order; the index's MDIDs filter
+            # before anything is read
+            lo, hi = self.index.span(start_ts, end_ts)
+            entries = (e for e in self.index.iter_entries(lo, hi)
+                       if mdid_requested(mdids, e[2]))
+            with open(self.tmns_path, "rb", buffering=0) as f:
+                for ts, _mdid, raw in tm.iter_indexed(f, entries):
+                    yield ts, raw
+            return
         rng = self.byte_range(start_ts, end_ts)
         if rng is None:
             return
@@ -119,10 +136,25 @@ class Recording:
 
 
 class Library:
-    """One or more recordings, played back in time order."""
+    """One or more recordings, played back in time order.
+
+    Recordings whose time spans overlap form a group whose messages are
+    merged by timestamp; groups play one after another.
+    """
 
     def __init__(self, recordings):
         self.recordings = sorted(recordings, key=lambda r: r.start_ts)
+        self.groups = []
+        group_end = None
+        for r in self.recordings:
+            if not len(r.index):
+                continue
+            if self.groups and r.start_ts <= group_end:
+                self.groups[-1].append(r)
+                group_end = max(group_end, r.end_ts)
+            else:
+                self.groups.append([r])
+                group_end = r.end_ts
 
     @property
     def start_ts(self):
@@ -149,9 +181,15 @@ class Library:
             return f"(not scanned: {n:,} index entries)"
         return str(sorted(self.mdids))
 
-    def messages(self, start_ts, end_ts, mdids):
-        for r in self.recordings:               # already time-ordered
-            yield from r.messages(start_ts, end_ts, mdids)
+    def messages(self, start_ts, end_ts, mdids, groups=None):
+        """Yield (timestamp, raw message) in timestamp order."""
+        for group in self.groups if groups is None else groups:
+            if len(group) == 1:
+                yield from group[0].messages(start_ts, end_ts, mdids)
+            else:
+                yield from heapq.merge(
+                    *(r.messages(start_ts, end_ts, mdids) for r in group),
+                    key=lambda m: m[0])
 
 
 def parse_range(rng, lib):
@@ -223,6 +261,15 @@ class TmnsRtspServer:
               f"{self.lib.total_messages():,} messages, MDIDs {self.lib.mdid_summary()}")
         print(f"[server] time span (PTP s): {tm.ts_to_seconds(self.lib.start_ts):.3f}"
               f" .. {tm.ts_to_seconds(self.lib.end_ts):.3f}")
+        # (an index without the order flag is checked here, not on PLAY)
+        for r in self.lib.recordings:
+            if not r.time_ordered:
+                print(f"[server] {os.path.basename(r.tmns_path)}: not in time "
+                      f"order; read in index order")
+        merged = sum(len(g) for g in self.lib.groups if len(g) > 1)
+        if merged:
+            print(f"[server] {merged} recording(s) overlap in time; their "
+                  f"messages are merged by timestamp")
         try:
             while True:
                 conn, addr = srv.accept()
@@ -456,10 +503,11 @@ class TmnsRtspServer:
             t0 = time.monotonic()
             try:
                 if sess.lower == "TCP" and asap and not sess.mdids:
-                    sent, nbytes, done = self._send_ranges(sess, sock, start_ts, end_ts)
+                    sent, nbytes, done = self._send_tcp_asap(sess, sock, start_ts, end_ts)
                 else:
                     sent, nbytes, done = self._send_messages(
-                        sess, sock, target, start_ts, end_ts, asap)
+                        sess, sock, target,
+                        self.lib.messages(start_ts, end_ts, sess.mdids), asap)
                 if done:
                     eod = tm.build_datamsg(0, 0, end_of_data=True)
                     if sess.lower == "UDP":
@@ -486,11 +534,22 @@ class TmnsRtspServer:
                 return False
         return not sess.stop.is_set()
 
-    def _send_ranges(self, sess, sock, start_ts, end_ts):
-        """Unfiltered TCP as fast as possible: copy file bytes straight to the
-        socket with sendfile() (no per-message work in Python)."""
+    def _send_tcp_asap(self, sess, sock, start_ts, end_ts):
+        """Unfiltered TCP as fast as possible.  A time-ordered recording that
+        overlaps no other is copied straight to the socket with sendfile()
+        (no per-message work in Python); other groups are merged and sent
+        message by message."""
         sent = nbytes = 0
-        for rec in self.lib.recordings:
+        for group in self.lib.groups:
+            rec = group[0]
+            if len(group) > 1 or not rec.time_ordered:
+                n, b, done = self._send_messages(
+                    sess, sock, None,
+                    self.lib.messages(start_ts, end_ts, [], [group]), True)
+                sent, nbytes = sent + n, nbytes + b
+                if not done:
+                    return sent, nbytes, False
+                continue
             rng = rec.byte_range(start_ts, end_ts)
             if rng is None:
                 continue
@@ -507,9 +566,10 @@ class TmnsRtspServer:
             sent += count
         return sent, nbytes, True
 
-    def _send_messages(self, sess, sock, target, start_ts, end_ts, asap):
-        """Send message by message: UDP (one datagram each), MDID-filtered
-        TCP, or real-time pacing.  TCP writes are coalesced into batches."""
+    def _send_messages(self, sess, sock, target, msgs, asap):
+        """Send (timestamp, message) pairs one by one: UDP (one datagram
+        each), MDID-filtered or merged TCP, or real-time pacing.  TCP writes
+        are coalesced into batches."""
         udp = sess.lower == "UDP"
         speed = sess.speed if sess.speed > 0 else 1.0
         sendto = sock.sendto
@@ -524,7 +584,7 @@ class TmnsRtspServer:
                 sock.sendall(b"".join(batch))
                 batch, size = [], 0
 
-        for ts, raw in self.lib.messages(start_ts, end_ts, sess.mdids):
+        for ts, raw in msgs:
             if not sess.streaming.is_set():
                 flush()
                 if not self._wait_playing(sess):

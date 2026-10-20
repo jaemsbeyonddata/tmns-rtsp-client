@@ -458,7 +458,25 @@ python3 tmns_rtsp_server.py --tmns-dir recordings/ --index-dir indexes/ --port 5
 ```
 
 Each `X.tmns` is paired with `X.index`; recordings are sorted by start time and
-streamed in order for the requested Range. The server implements the full
+streamed in order for the requested Range. Recordings whose time spans overlap
+are merged message by message in timestamp order.
+
+**Out-of-order recordings.** A `.tmns` doesn't have to be in time order (a
+Chapter 10 file can interleave channels out of order). The index header
+records whether it is; an index written before that flag existed is checked
+once at start-up. An out-of-order recording is played by walking the index, so
+messages still go out in timestamp order: back-to-back messages are fetched
+with one read, and an MDID filter is applied from the index, before reading.
+
+> **Note — another way to play them.** An out-of-order recording could
+> instead be played *as recorded*: messages in file order, keeping the
+> original interleaving between channels. The Range would then select the
+> messages whose timestamps fall inside it, but they would leave in arrival
+> order rather than timestamp order. The bytes to scan would span from the
+> lowest to the highest file offset of those messages, not one contiguous
+> time slice. Real-time pacing would also need a rule for timestamps that go
+> backwards (for example, send them at once). This server uses timestamp
+> order; as-recorded playback isn't implemented. The server implements the full
 control channel and **passes the conformance suite** (19 checks over UDP, 20
 over TCP).
 
@@ -473,7 +491,9 @@ growing in memory:
   50M entries, since listing them reads the whole index.)
 - **Zero-copy TCP.** An `--asap` (or `Speed: 0`) PLAY over TCP with no MDID
   filter sends the Range as file bytes straight to the socket with
-  `sendfile()`, a few MB at a time so PAUSE still takes effect at once.
+  `sendfile()`, a few MB at a time so PAUSE still takes effect at once. This
+  applies to a time-ordered recording that overlaps no other; the rest are
+  read in timestamp order (above) and sent in batches.
 - **Large reads, batched writes.** Every other mode reads the `.tmns` in 4 MB
   chunks and sends messages from them without copying; TCP writes are
   coalesced up to 256 KB.
